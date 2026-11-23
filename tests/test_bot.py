@@ -886,6 +886,103 @@ class Dca(InTmp):
         self.assertIn("No dollar-cost averaging plan running", out)
 
 
+class RebalDates(unittest.TestCase):
+    def test_monthly_and_quarterly(self):
+        mon = datetime.date(2026, 11, 23)
+        self.assertEqual(bot.rebal_next({"every": "monthly", "day": "1"}, mon, True), datetime.date(2026, 12, 1))
+        self.assertEqual(bot.rebal_next({"every": "quarterly", "day": "1"}, mon, True), datetime.date(2027, 1, 1))
+        self.assertEqual(bot.rebal_next({"every": "quarterly", "day": "1"}, datetime.date(2027, 1, 1), False),
+                         datetime.date(2027, 4, 1))
+
+
+class Rebal(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeDca(cash=50000)
+        self.api.prices.update(VTI=100.0, BND=50.0, GLD=200.0)
+
+    def due(self):
+        st = bot.load(bot.REBAL)
+        st["next"] = TODAY.isoformat()
+        bot.save(bot.REBAL, st)
+
+    def start_and_fund(self, *extra):
+        run(self.api, "rebal", "start", "VTI:60", "BND:40", "--dollars", "10000", *extra)
+        return run(self.api, "rebal", "run")
+
+    def test_funds_at_target_weights(self):
+        rc, out = self.start_and_fund()
+        self.assertIn("VTI: BUY 60 shares (~$6000.00) at about 100.00", out)
+        self.assertIn("BND: BUY 80 shares (~$4000.00) at about 50.00", out)
+        st = bot.load(bot.REBAL)
+        self.assertEqual(st["shares"], {"VTI": 60.0, "BND": 80.0})
+        self.assertTrue(st["funded"])
+        self.assertEqual(st["next"], bot.rebal_next(st, TODAY, False).isoformat())
+
+    def test_inside_the_band_does_nothing(self):
+        self.start_and_fund()
+        self.api.prices["VTI"] = 110.0  # VTI 6600 / 10600 = 62.3%: 2.3 points off
+        self.due()
+        n = len(self.api.sent)
+        rc, out = run(self.api, "rebal", "run")
+        self.assertIn("Largest drift 2.3 points, inside the 5-point band; no trades", out)
+        self.assertEqual(len(self.api.sent), n)
+
+    def test_drift_past_the_band_sells_then_buys(self):
+        self.start_and_fund()
+        self.api.prices["VTI"] = 150.0  # VTI 9000 / 13000 = 69.2%: 9.2 points off
+        self.due()
+        rc, out = run(self.api, "rebal", "run")
+        self.assertIn("VTI is 9.2 points off; back to target", out)
+        sells = [o for o in self.api.sent if o["side"] == "sell"]
+        buys = [o for o in self.api.sent[2:] if o["side"] == "buy"]
+        self.assertEqual(sells[0]["symbol"], "VTI")
+        self.assertAlmostEqual(sells[0]["notional"], 1200.0)  # 9000 - 0.6 * 13000
+        self.assertEqual(buys[0]["symbol"], "BND")
+        self.assertLess(self.api.sent.index(sells[0]), self.api.sent.index(buys[0]))
+        total, rows = bot.rebal_book(self.api, bot.load(bot.REBAL))
+        self.assertAlmostEqual(rows["VTI"][3], 0.6, places=3)
+
+    def test_whole_shares_when_not_fractionable(self):
+        self.api.whole_only.update({"VTI", "BND"})
+        rc, out = self.start_and_fund()
+        self.assertEqual([o.get("qty") for o in self.api.sent], [60, 80])
+
+    def test_not_enough_cash_to_fund(self):
+        self.api.cash = 500
+        rc, out = self.start_and_fund()
+        self.assertIn("needs $10000 to start, cash is $500; nothing bought", out)
+        self.assertFalse(bot.load(bot.REBAL)["funded"])
+
+    def test_refuses_names_other_strategies_trade(self):
+        bot.save(bot.DCA, {"status": "on", "weights": {"VTI": 1.0}, "buys": [], "carry": {}})
+        rc, out = run(self.api, "rebal", "start", "VTI:60", "BND:40")
+        self.assertEqual(rc, 1)
+        self.assertIn("VTI is traded by the dca strategy", out)
+
+    def test_can_restart_with_new_weights_not_new_names(self):
+        self.start_and_fund()
+        rc, out = run(self.api, "rebal", "start", "VTI:50", "BND:50")
+        self.assertEqual(rc, 0)
+        rc, out = run(self.api, "rebal", "start", "VTI:50", "GLD:50")
+        self.assertEqual(rc, 1)
+        self.assertIn("changing the names would orphan shares", out)
+
+    def test_status_dry_run_and_stop(self):
+        rc, out = run(self.api, "--dry-run", "rebal", "start", "VTI:60", "BND:40", "--dollars", "1000")
+        self.assertIn("VTI: WOULD BUY 6 shares", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.REBAL))
+        self.start_and_fund()
+        self.api.prices["VTI"] = 110.0
+        rc, out = run(self.api, "status")
+        self.assertIn("rebal: on, VTI 62.3% (target 60%), BND 37.7% (target 40%); worth $10600.00 (+6.0% on $10000)", out)
+        rc, out = run(self.api, "rebal", "stop")
+        self.assertIn("no more trades", out)
+        rc, out = run(self.api, "rebal", "run")
+        self.assertIn("No rebalance plan running", out)
+
+
 ET = datetime.timezone(datetime.timedelta(hours=-5))
 
 

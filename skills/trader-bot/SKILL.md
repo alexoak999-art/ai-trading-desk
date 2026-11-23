@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs eight rule-based strategies on a schedule: a
+  a one-share buy, then runs nine rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -19,14 +19,16 @@ description: >-
   chosen names weekly, every other week or monthly, fractional shares, no
   selling: the buy-and-hold baseline), and covered calls only (calls on 100
   shares you hold, 10% above the price and never below cost, bought back at
-  50% profit). Paper account only. Use when the user says "trading bot",
+  50% profit), and rebalancing (money put into target weights, sold back to
+  target monthly or quarterly when a name drifts past a band). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
   breakout", "ORB", "day trade automatically", "oversold bounce", "buy the
   dip on RSI", "dollar-cost averaging", "DCA", "buy every week", "covered calls
-  only", "sell calls on my shares", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | status]"
+  only", "sell calls on my shares", "rebalance",
+  "target weights", "60/40", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -246,6 +248,28 @@ Tell the user what the numbers mean before starting: a call far above the
 price on a calm stock pays little (the preview shows the actual bid/ask), and
 a call that ends in the money sells the shares at the strike, capping the gain.
 
+## Step 5g: strategy 9, rebalance to target weights
+
+A long-term allocation kept on target: `rebal start SYM:W ...` stores the
+plan; `rebal run` once a day (10:00 AM ET is fine) acts only on its dates.
+The user picks the names and weights; do not pick for them.
+
+1. **Start**: the first run puts `--dollars` (10000) in at the target
+   weights, at market, fractional where Alpaca allows (whole shares
+   otherwise). It needs that much cash, or it waits and says so.
+2. **Checks**: day `--day` (1) of each month, or of Jan/Apr/Jul/Oct with
+   `--every quarterly`. If every name is within `--band` (5) percentage
+   points of its target, nothing is traded.
+3. **Rebalance**: otherwise it sells what is overweight first, then buys
+   what is underweight with that cash, back to the targets. Trades under
+   `--min-trade` ($25) are skipped.
+4. It keeps its own share count (a sleeve), so it never sells shares
+   another strategy bought. It refuses a name another strategy trades or
+   holds; the others keep out of its names. New weights for the same names
+   are fine; new names need `rebal stop` first.
+5. No stops: it is an allocation, not a trade. `rebal stop` ends trading;
+   the holdings stay.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -263,6 +287,7 @@ as a Mac mini), with the user's own folder:
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py bounce run >> trader/bot/cron.log 2>&1
 0 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py dca run >> trader/bot/cron.log 2>&1
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py cc run >> trader/bot/cron.log 2>&1
+5 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rebal run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to

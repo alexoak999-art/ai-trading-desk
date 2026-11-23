@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
-day trade, an oversold bounce, dollar-cost averaging, and covered calls.
-PAPER ACCOUNT ONLY.
+day trade, an oversold bounce, dollar-cost averaging, covered calls, and
+rebalancing to target weights. PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -26,6 +26,9 @@ PAPER ACCOUNT ONLY.
   python bot.py cc start AAPL --otm 10 --dte 14-28 --take-profit 50 [--buy-shares]
   python bot.py cc run                                  # every 15 min in market hours
   python bot.py cc stop AAPL                            # no new calls; the open one is still managed
+  python bot.py rebal start VTI:60 BND:40 --dollars 10000 --every monthly --day 1 --band 5
+  python bot.py rebal run                               # once a day; trades only on its dates
+  python bot.py rebal stop                              # no more trades; holdings stay
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -571,6 +574,8 @@ def strategy_symbols():
             out.update({s: "orb" for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")})
         elif f == "dca.json" and st.get("status") == "on":
             out.update({s: "dca" for s in st.get("weights", {})})
+        elif f == "rebal.json" and (st.get("status") == "on" or any(st.get("shares", {}).values())):
+            out.update({s: "rebal" for s in st.get("weights", {})})
     return out
 
 
@@ -1244,6 +1249,203 @@ def dca_stop(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 9: rebalance to target weights
+
+REBAL = os.path.join(DIR, "rebal.json")
+
+
+def rebal_next(st, after, inclusive):
+    """The next rebalance date: day N of each month, or of Jan/Apr/Jul/Oct for quarterly."""
+    d = dca_next({"every": "monthly", "day": st["day"]}, after, inclusive)
+    while st["every"] == "quarterly" and d.month not in (1, 4, 7, 10):
+        d = dca_next({"every": "monthly", "day": st["day"]}, d, False)
+    return d
+
+
+def rebal_book(api, st):
+    """(total value, {sym: (shares, price, value, weight now)}) of what the sleeve holds."""
+    rows = {}
+    for sym in st["weights"]:
+        q = st["shares"].get(sym, 0.0)
+        p = api.last_price(sym)
+        rows[sym] = [q, p, q * p]
+    total = sum(r[2] for r in rows.values())
+    for r in rows.values():
+        r.append(r[2] / total if total else 0.0)
+    return total, rows
+
+
+def rebal_trade(api, st, sym, side, dollars, price, dry, out):
+    """One market order for about `dollars` of sym. Fractional (notional) where Alpaca allows,
+    whole shares otherwise. Updates the sleeve's share count once filled."""
+    if (api.asset(sym) or {}).get("fractionable"):
+        order, qty = dict(notional=round(dollars, 2)), dollars / price
+    else:
+        qty = int(dollars // price)
+        if side == "sell":
+            qty = min(qty, int(st["shares"].get(sym, 0)))
+        if qty < 1:
+            out.append("%s: $%.2f is less than one whole share at %.2f (not fractionable); skipped." % (
+                sym, dollars, price))
+            return 0.0
+        order = dict(qty=qty)
+    o = wait_fill(api, api.submit_order(symbol=sym, side=side, type="market", time_in_force="day", **order))
+    px = float(o.get("filled_avg_price") or price)
+    qty = float(o.get("filled_qty") or qty)
+    if o.get("status") in ("filled", "dry_run"):
+        st["shares"][sym] = round(st["shares"].get(sym, 0.0) + (qty if side == "buy" else -qty), 6)
+    else:
+        st["pending"].append({"order_id": o.get("id"), "symbol": sym, "side": side})
+    log("rebal_" + side, symbol=sym, qty=round(qty, 6), price=money(px), dry_run=dry)
+    out.append("%s: %s %s shares (~$%.2f) at about %.2f." % (
+        sym, ("WOULD " + side.upper()) if dry else side.upper(), ("%.4f" % qty).rstrip("0").rstrip("."), qty * px, px))
+    return qty * px
+
+
+def rebal_step(api, st, today, dry):
+    out = []
+    # 1. settle orders that had not filled
+    for p in list(st["pending"]):
+        o = api.order(p["order_id"]) or {}
+        if o.get("status") == "filled":
+            q = float(o.get("filled_qty") or 0)
+            st["shares"][p["symbol"]] = round(st["shares"].get(p["symbol"], 0.0) + (q if p["side"] == "buy" else -q), 6)
+            st["pending"].remove(p)
+        elif o.get("status") not in LIVE:
+            st["pending"].remove(p)
+            out.append("%s: a %s order ended %s." % (p["symbol"], p["side"], o.get("status", "unknown")))
+    if st["pending"]:
+        out.append("Waiting for %d order(s) to fill before trading again." % len(st["pending"]))
+        return out
+    if st.get("status") != "on":
+        return out
+    if today < datetime.date.fromisoformat(st["next"]):
+        total, rows = rebal_book(api, st)
+        drift = max(abs(r[3] - st["weights"][s]) for s, r in rows.items()) * 100 if total else 0
+        out.append("Rebalance: worth $%.2f, largest drift %.1f points; next check %s." % (total, drift, st["next"]))
+        return out
+    cash = float(api.account().get("cash") or 0)
+
+    # 2. first time: put the money in at the target weights
+    if not st.get("funded"):
+        if cash < st["dollars"]:
+            out.append("Rebalance: needs $%.0f to start, cash is $%.0f; nothing bought." % (st["dollars"], cash))
+            return out
+        for sym, w in st["weights"].items():
+            rebal_trade(api, st, sym, "buy", st["dollars"] * w, api.last_price(sym), dry, out)
+        st["funded"] = True
+        st["history"].append({"date": today.isoformat(), "event": "funded", "dollars": st["dollars"]})
+        st["next"] = rebal_next(st, today, False).isoformat()
+        out.append("Funded with $%g at the target weights. Next rebalance check %s." % (st["dollars"], st["next"]))
+        return out
+
+    # 3. a rebalance date: trade only if something drifted past the band
+    total, rows = rebal_book(api, st)
+    st["next"] = rebal_next(st, today, False).isoformat()
+    if not total:
+        out.append("Rebalance: the sleeve holds nothing (sold outside the bot?). Next check %s." % st["next"])
+        return out
+    drifts = {s: (r[3] - st["weights"][s]) * 100 for s, r in rows.items()}
+    worst = max(drifts, key=lambda s: abs(drifts[s]))
+    summary = ", ".join("%s %.1f%% (target %.0f%%)" % (s, rows[s][3] * 100, st["weights"][s] * 100) for s in rows)
+    if abs(drifts[worst]) < st["band"]:
+        out.append("Rebalance: %s. Largest drift %.1f points, inside the %g-point band; no trades. Next check %s."
+                   % (summary, abs(drifts[worst]), st["band"], st["next"]))
+        st["history"].append({"date": today.isoformat(), "event": "checked", "value": money(total),
+                              "max_drift": round(abs(drifts[worst]), 2)})
+        return out
+    out.append("Rebalance: %s. %s is %.1f points off; back to target:" % (summary, worst, abs(drifts[worst])))
+    diffs = {s: total * st["weights"][s] - rows[s][2] for s in rows}
+    for s, d in sorted(diffs.items(), key=lambda kv: kv[1]):  # sells first, to free the cash
+        if d <= -st["min_trade"]:
+            cash += rebal_trade(api, st, s, "sell", min(-d, rows[s][2]), rows[s][1], dry, out)
+    for s, d in sorted(diffs.items(), key=lambda kv: -kv[1]):
+        if d >= st["min_trade"]:
+            amt = min(d, cash)
+            if amt < st["min_trade"]:
+                out.append("%s: needs $%.2f more but cash is short; skipped." % (s, d))
+                continue
+            cash -= rebal_trade(api, st, s, "buy", amt, rows[s][1], dry, out)
+    st["history"].append({"date": today.isoformat(), "event": "rebalanced", "value": money(total),
+                          "max_drift": round(abs(drifts[worst]), 2)})
+    out.append("Next rebalance check %s." % st["next"])
+    return out
+
+
+def rebal_start(api, a):
+    try:
+        weights = parse_weights(a.symbols)
+    except ValueError as e:
+        say("rebal: %s (use SYMBOL:WEIGHT, e.g. VTI:60 BND:40)" % e)
+        return 1
+    errs = []
+    if len(weights) < 2:
+        errs.append("give at least two names to balance")
+    if a.dollars < 100:
+        errs.append("--dollars must be at least 100")
+    if not (a.day.isdigit() and 1 <= int(a.day) <= 28):
+        errs.append("--day is a day of the month, 1-28")
+    if a.band < 0 or a.min_trade < 1:
+        errs.append("--band must be 0 or more and --min-trade at least 1")
+    others = strategy_symbols()
+    for s, other in ((s, others.get(s)) for s in weights):
+        if not other or other == "rebal":
+            continue
+        errs.append("%s is traded by the %s strategy; pick another name" % (s, other))
+    for e in errs:
+        say("rebal: " + e)
+    if errs:
+        return 1
+    st = load(REBAL)
+    if st and st.get("funded") and set(st["weights"]) != set(weights):
+        say("rebal: a funded plan holds %s; changing the names would orphan shares. `rebal stop` first, "
+            "or keep the same names with new weights." % ", ".join(st["weights"]))
+        return 1
+    st = st or {"shares": {}, "pending": [], "history": [], "funded": False}
+    st.update(weights=weights, dollars=a.dollars, every=a.every, day=a.day, band=a.band,
+              min_trade=a.min_trade, status="on")
+    st["next"] = datetime.date.today().isoformat() if not st["funded"] else rebal_next(
+        st, datetime.date.today(), True).isoformat()
+    if not a.dry_run:
+        save(REBAL, st)
+    say("Rebalance: put $%g into %s, then on day %s of each %s sell what is overweight and buy what is "
+        "underweight, if any name is %g or more points off target (trades under $%g are skipped). "
+        "No stops: it is a long-term allocation. `rebal run` does the work." % (
+            a.dollars, ", ".join("%s %.0f%%" % (s, w * 100) for s, w in weights.items()), a.day,
+            "month" if a.every == "monthly" else "quarter (Jan, Apr, Jul, Oct)", a.band, a.min_trade))
+    if a.dry_run:
+        say("Preview of the first `rebal run` (nothing is saved or sent):")
+        for m in rebal_step(api, st, datetime.date.today(), True):
+            say(m)
+    return 0
+
+
+def rebal_run(api, a):
+    st = load(REBAL)
+    if not st or (st.get("status") != "on" and not st.get("pending")):
+        say("No rebalance plan%s." % (" running" if st else ". Start one with `rebal start SYM:W ...`"))
+        return 0
+    if not market_open(api):
+        return 0
+    for m in rebal_step(api, st, datetime.date.today(), a.dry_run):
+        say(m)
+    if not a.dry_run:
+        save(REBAL, st)
+    return 0
+
+
+def rebal_stop(api, a):
+    st = load(REBAL)
+    if not st:
+        say("No rebalance plan.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(REBAL, st)
+    say("Rebalance stopped: no more trades. What it holds stays in the account.")
+    return 0
+
+
 # ---------------------------------------------------------------- strategy 5: opening-range breakout
 
 ORB = os.path.join(DIR, "orb.json")
@@ -1555,6 +1757,13 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
+        elif f == "rebal.json":
+            total, rows = rebal_book(api, st)
+            say("rebal: %s, %s; worth $%.2f%s; next check %s" % (
+                st.get("status"), ", ".join("%s %.1f%% (target %.0f%%)" % (s, r[3] * 100, st["weights"][s] * 100)
+                                            for s, r in rows.items()),
+                total, " (%+.1f%% on $%g)" % ((total / st["dollars"] - 1) * 100, st["dollars"])
+                if st.get("funded") else ", not funded yet", st.get("next")))
         elif f == "dca.json":
             cost, value, held = dca_value(api, st)
             say("dca: %s, $%g %s into %s; next buy %s; invested $%.2f, worth $%.2f%s" % (
@@ -1669,6 +1878,17 @@ def parser():
     d.add_parser("run")
     d.add_parser("stop")
 
+    r = sub.add_parser("rebal").add_subparsers(dest="sub", required=True)
+    p = r.add_parser("start")
+    p.add_argument("symbols", nargs="+", help="SYMBOL:WEIGHT, e.g. VTI:60 BND:40")
+    p.add_argument("--dollars", type=float, default=10000, help="dollars to put in at the start (default 10000)")
+    p.add_argument("--every", choices=("monthly", "quarterly"), default="monthly")
+    p.add_argument("--day", default="1", help="day of the month to check, 1-28 (default 1)")
+    p.add_argument("--band", type=float, default=5, help="rebalance only if a name is this many points off (default 5)")
+    p.add_argument("--min-trade", type=float, default=25, help="skip trades smaller than this many dollars (default 25)")
+    r.add_parser("run")
+    r.add_parser("stop")
+
     c = sub.add_parser("cc").add_subparsers(dest="sub", required=True)
     p = c.add_parser("start")
     p.add_argument("symbol")
@@ -1700,7 +1920,8 @@ def main(argv=None, api=None):
           ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop,
           ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop,
           ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop,
-          ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop,
+          ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
