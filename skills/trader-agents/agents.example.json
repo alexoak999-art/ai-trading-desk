@@ -1,0 +1,11 @@
+{
+ "names": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"],
+ "technical": {
+  "ma_days": 200,
+  "slope_days": 20,
+  "roc_days": 63,
+  "roc_peak_min": 15.0,
+  "peak_lookback": 63,
+  "roc_reset_max": 5.0
+ }
+}
