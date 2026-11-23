@@ -14,10 +14,18 @@ Built from an idea on the Titans of Tomorrow podcast.
 desk summary per name, and records paper trades only when you say so
 (`paper.py`). Works best with the Day Trader skill pack installed.
 
+## Trading bot (`/trader-bot`)
+
+An Alpaca **paper-trading** bot with three strategies, rebuilt from a Claude
+course video: a trailing stop with ladder buys (the stop is a real order at
+Alpaca), copying stock trades members of Congress disclose, and the options
+wheel. Keys go in `trader/alpaca.env`, never in the chat; there is no live
+trading address in the code. Step-by-step setup: `skills/trader-bot/SKILL.md`.
+
 ## Install (Claude Code)
 
 ```bash
-cp -r skills/trader-agents ~/.claude/skills/
+cp -r skills/trader-agents skills/trader-bot ~/.claude/skills/
 cp agents/*.md ~/.claude/agents/
 ```
 
