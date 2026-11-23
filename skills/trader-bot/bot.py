@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
-day trade, an oversold bounce, dollar-cost averaging, covered calls, and
-rebalancing to target weights. PAPER ACCOUNT ONLY.
+day trade, an oversold bounce, dollar-cost averaging, covered calls,
+rebalancing to target weights, and a gap-and-go day trade. PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -29,6 +29,9 @@ rebalancing to target weights. PAPER ACCOUNT ONLY.
   python bot.py rebal start VTI:60 BND:40 --dollars 10000 --every monthly --day 1 --band 5
   python bot.py rebal run                               # once a day; trades only on its dates
   python bot.py rebal stop                              # no more trades; holdings stay
+  python bot.py gap start AMZN TSLA --min-gap 3 [--max-gap 10] --stop open --target-r 2
+  python bot.py gap run                                 # every 5 min in market hours
+  python bot.py gap stop                                # no new trades; open ones still flat by close
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -570,8 +573,8 @@ def strategy_symbols():
             out[st["symbol"]] = f.split("-")[0]
         elif f in ("swing.json", "bounce.json"):
             out.update({s: f[:-5] for s in st.get("positions", {})})
-        elif f == "orb.json":
-            out.update({s: "orb" for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")})
+        elif f in ("orb.json", "gap.json"):
+            out.update({s: f[:-5] for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")})
         elif f == "dca.json" and st.get("status") == "on":
             out.update({s: "dca" for s in st.get("weights", {})})
         elif f == "rebal.json" and (st.get("status") == "on" or any(st.get("shares", {}).values())):
@@ -1488,7 +1491,7 @@ def orb_close(st, sym, t, px, how, dry):
     t.update(status="closed", exit=money(px), how=how, r=round((px - t["entry"]) / risk, 2) if risk > 0 else 0,
              pnl=money((px - t["entry"]) * t["qty"]))
     st["history"].append(dict(t, symbol=sym))
-    log("orb_exit", symbol=sym, qty=t["qty"], entry=t["entry"], exit=money(px), how=how, r=t["r"],
+    log(st.get("kind", "orb") + "_exit", symbol=sym, qty=t["qty"], entry=t["entry"], exit=money(px), how=how, r=t["r"],
         pnl=t["pnl"], dry_run=dry)
     return "%s: %s at about %.2f: %+.2fR, $%+.2f." % (sym, how, px, t["r"], t["pnl"])
 
@@ -1583,13 +1586,28 @@ def orb_step(api, st, now, dry):
             out.append("%s: no bars in the opening range (IEX feed); skipped." % sym)
             continue
         hi, lo = max(float(b["h"]) for b in inside), min(float(b["l"]) for b in inside)
+        day_open, label = float(inside[0]["o"]), "BREAKOUT"
+        if st.get("min_gap") is not None:
+            try:
+                prev = prev_close(sym, now.date())
+            except Exception as e:
+                out.append("%s: no previous close from Yahoo (%s); skipped." % (sym, e))
+                continue
+            gap = (day_open / prev - 1) * 100
+            if gap < st["min_gap"] or (st.get("max_gap") and gap > st["max_gap"]):
+                out.append("%s: gap %+.1f%% (open %.2f vs %.2f yesterday); needs %+g%%%s. No trade today." % (
+                    sym, gap, day_open, prev, st["min_gap"],
+                    " to %+g%%" % st["max_gap"] if st.get("max_gap") else " or more"))
+                continue
+            label = "GAP-AND-GO, gap %+.1f%%" % gap
         brk = next((b for b in after if float(b["c"]) > hi), None)
         if not brk:
             last = float(after[-1]["c"]) if after else float(inside[-1]["c"])
             out.append("%s: waiting. Range %.2f-%.2f; last 5-min close %.2f (%.2f below the high)."
                        % (sym, lo, hi, last, hi - last))
             continue
-        stop = money((hi + lo) / 2 if st["stop_at"] == "mid" else lo)
+        stop = money(day_open - 0.01 if st["stop_at"] == "open"
+                     else (hi + lo) / 2 if st["stop_at"] == "mid" else lo)
         brk_t = parse_ts(brk["t"]).astimezone(now.tzinfo)
         brk_at = brk_t.strftime("%H:%M")
         if brk_t + BAR < now - 2 * BAR:
@@ -1628,11 +1646,11 @@ def orb_step(api, st, now, dry):
                        "order_id": o.get("id"), "range": [money(lo), money(hi)], "breakout": brk_at,
                        "status": "open" if filled else "buying"}
         taken, cash = taken + 1, cash - qty * entry
-        log("orb_entry", symbol=sym, qty=qty, entry=entry, stop=stop, target=target, range_high=money(hi),
+        log(st.get("kind", "orb") + "_entry", symbol=sym, qty=qty, entry=entry, stop=stop, target=target, range_high=money(hi),
             range_low=money(lo), dry_run=dry)
-        out.append("%s: BREAKOUT (5-min close %.2f > range high %.2f at %s) -> %s %d at about %.2f; stop %.2f, "
+        out.append("%s: %s (5-min close %.2f > range high %.2f at %s) -> %s %d at about %.2f; stop %.2f, "
                    "target %.2f (%gR) held at Alpaca; risk $%.0f; flat by %s." % (
-                       sym, float(brk["c"]), hi, brk_at, "WOULD BUY" if dry else "BUY", qty, entry, stop,
+                       sym, label, float(brk["c"]), hi, brk_at, "WOULD BUY" if dry else "BUY", qty, entry, stop,
                        target, st["target_r"], qty * risk, st["flat_by"]))
     return out
 
@@ -1672,32 +1690,108 @@ def orb_start(api, a):
     return 0
 
 
-def orb_run(api, a):
-    st = load(ORB)
+def day_plan_run(api, a, path, title, cmd):
+    st = load(path)
     if not st or (st.get("status") != "on" and not any(
             t["status"] in ("open", "buying") for t in (st.get("today") or {}).values())):
-        say("No opening-range plan. Start one with `orb start SYMBOL ...`.")
+        say("No %s plan. Start one with `%s start SYMBOL ...`." % (title, cmd))
         return 0
     if not market_open(api):
         return 0
     for m in orb_step(api, st, et_now(api), a.dry_run):
         say(m)
     if not a.dry_run:
-        save(ORB, st)
+        save(path, st)
     return 0
 
 
-def orb_stop(api, a):
-    st = load(ORB)
+def day_plan_stop(api, a, path, title):
+    st = load(path)
     if not st:
-        say("No opening-range plan.")
+        say("No %s plan." % title)
         return 0
     st["status"] = "off"
     if not a.dry_run:
-        save(ORB, st)
-    say("Opening-range breakout: no new trades. Anything open keeps its bracket and is still sold by %s."
-        % st["flat_by"])
+        save(path, st)
+    say("%s: no new trades. Anything open keeps its bracket and is still sold by %s."
+        % (title[0].upper() + title[1:], st["flat_by"]))
     return 0
+
+
+def orb_run(api, a):
+    return day_plan_run(api, a, ORB, "opening-range", "orb")
+
+
+def orb_stop(api, a):
+    return day_plan_stop(api, a, ORB, "opening-range breakout")
+
+
+# ---------------------------------------------------------------- strategy 10: gap-and-go
+
+GAP = os.path.join(DIR, "gap.json")
+
+
+def prev_close(sym, today):
+    """Yesterday's official close (not dividend-adjusted), from Yahoo daily bars."""
+    tr = trend_module()
+    data = tr.http_json("/v8/finance/chart/%s?range=1mo&interval=1d" % sym.replace(".", "-"))
+    r = data["chart"]["result"][0]
+    off = (r.get("meta") or {}).get("gmtoffset") or 0
+    closes = r["indicators"]["quote"][0]["close"]
+    rows = [c for t, c in zip(r["timestamp"], closes) if c is not None and
+            datetime.datetime.fromtimestamp(t + off, datetime.timezone.utc).date() < today]
+    if not rows:
+        raise RuntimeError("no daily closes")
+    return float(rows[-1])
+
+
+def gap_start(api, a):
+    syms = sorted({s.upper() for s in a.symbols})
+    errs = []
+    if a.range % 5 or not 5 <= a.range <= 30:
+        errs.append("--range must be 5 to 30 minutes, in steps of 5")
+    if a.min_gap <= 0 or (a.max_gap is not None and a.max_gap <= a.min_gap):
+        errs.append("--min-gap must be positive, and --max-gap above it")
+    if a.target_r <= 0 or a.dollars <= 0 or a.max_loss <= 0 or a.max_trades < 1:
+        errs.append("--target-r, --dollars, --max-loss and --max-trades must be positive")
+    try:
+        le, fb = (datetime.time(*(int(x) for x in v.split(":"))) for v in (a.last_entry, a.flat_by))
+        if not datetime.time(9, 30) < le < fb <= datetime.time(16, 0):
+            errs.append("times must run 9:30 < --last-entry < --flat-by <= 16:00")
+    except ValueError:
+        errs.append("--last-entry and --flat-by are HH:MM, New York time")
+    for e in errs:
+        say("gap: " + e)
+    if errs:
+        return 1
+    trend_module()  # yesterday's close comes from Yahoo through trader-agents' trend.py
+    st = load(GAP) or {"today": {}, "history": [], "day": None}
+    st.update(kind="gap", symbols=syms, range_min=a.range, stop_at=a.stop, target_r=a.target_r,
+              dollars=a.dollars, max_loss=a.max_loss, max_trades=a.max_trades, last_entry=a.last_entry,
+              flat_by=a.flat_by, min_gap=a.min_gap, max_gap=a.max_gap, status="on")
+    if not a.dry_run:
+        save(GAP, st)
+    say("Gap-and-go on %s: only names that open %g%% or more above yesterday's close%s. Then buy when a 5-minute "
+        "bar closes above the first %d minutes' high (until %s), stop %s, target %gR, as one bracket order at "
+        "Alpaca. Up to $%g a trade and $%g of risk, %d trades a day, one per name, long only. Everything is "
+        "sold by %s." % (
+            ", ".join(syms), a.min_gap, " (and at most %g%%)" % a.max_gap if a.max_gap else "", a.range,
+            a.last_entry, {"open": "just under the day's open", "mid": "at the range midpoint",
+                           "low": "at the range low"}[a.stop], a.target_r, a.dollars, a.max_loss,
+            a.max_trades, a.flat_by))
+    if a.dry_run:
+        say("Preview of a `gap run` now (nothing is saved or sent):")
+        for m in orb_step(api, st, et_now(api), True):
+            say(m)
+    return 0
+
+
+def gap_run(api, a):
+    return day_plan_run(api, a, GAP, "gap-and-go", "gap")
+
+
+def gap_stop(api, a):
+    return day_plan_stop(api, a, GAP, "gap-and-go")
 
 
 # ---------------------------------------------------------------- check / status
@@ -1778,9 +1872,9 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
-        elif f == "orb.json":
+        elif f in ("orb.json", "gap.json"):
             hist = st.get("history", [])
-            say("orb: %s, watching %s; today (%s): %s; past trades %d%s" % (
+            say(f[:-5] + ": %s, watching %s; today (%s): %s; past trades %d%s" % (
                 st.get("status"), ", ".join(st.get("symbols", [])), st.get("day"),
                 ", ".join("%s %s" % (s, t["status"]) for s, t in sorted((st.get("today") or {}).items()))
                 or "none", len(hist),
@@ -1889,6 +1983,23 @@ def parser():
     r.add_parser("run")
     r.add_parser("stop")
 
+    g = sub.add_parser("gap").add_subparsers(dest="sub", required=True)
+    p = g.add_parser("start")
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--min-gap", type=float, default=3, help="open at least this %% above yesterday's close (default 3)")
+    p.add_argument("--max-gap", type=float, help="and at most this %% (no limit by default)")
+    p.add_argument("--range", type=int, default=5, help="first minutes whose high must break (default 5)")
+    p.add_argument("--stop", choices=("open", "mid", "low"), default="open",
+                   help="stop just under the day's open (default), or the range midpoint or low")
+    p.add_argument("--target-r", type=float, default=2, help="target, in multiples of the risk (default 2)")
+    p.add_argument("--dollars", type=float, default=2000, help="most dollars in one trade (default 2000)")
+    p.add_argument("--max-loss", type=float, default=100, help="most dollars lost at the stop (default 100)")
+    p.add_argument("--max-trades", type=int, default=3, help="trades a day at most (default 3)")
+    p.add_argument("--last-entry", default="10:30", help="no new entries from this time, ET (default 10:30)")
+    p.add_argument("--flat-by", default="15:55", help="sell everything by this time, ET (default 15:55)")
+    g.add_parser("run")
+    g.add_parser("stop")
+
     c = sub.add_parser("cc").add_subparsers(dest="sub", required=True)
     p = c.add_parser("start")
     p.add_argument("symbol")
@@ -1921,7 +2032,8 @@ def main(argv=None, api=None):
           ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop,
           ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop,
           ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop,
-          ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop,
+          ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:

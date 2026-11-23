@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs nine rule-based strategies on a schedule: a
+  a one-share buy, then runs ten rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -20,15 +20,19 @@ description: >-
   selling: the buy-and-hold baseline), and covered calls only (calls on 100
   shares you hold, 10% above the price and never below cost, bought back at
   50% profit), and rebalancing (money put into target weights, sold back to
-  target monthly or quarterly when a name drifts past a band). Paper account only. Use when the user says "trading bot",
+  target monthly or quarterly when a name drifts past a band), and a
+  gap-and-go day trade (a stock that opens 3%+ above yesterday's close and
+  breaks its first 5 minutes' high, stop just under the open, 2R target,
+  flat by 3:55 PM). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
   breakout", "ORB", "day trade automatically", "oversold bounce", "buy the
   dip on RSI", "dollar-cost averaging", "DCA", "buy every week", "covered calls
   only", "sell calls on my shares", "rebalance",
-  "target weights", "60/40", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | status]"
+  "target weights", "60/40", "gap and go",
+  "trade the gappers", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -270,6 +274,27 @@ The user picks the names and weights; do not pick for them.
 5. No stops: it is an allocation, not a trade. `rebal stop` ends trading;
    the holdings stay.
 
+## Step 5h: strategy 10, gap-and-go (day trade)
+
+The opening-range breakout's engine with a gap filter: `gap start SYMBOL ...`
+stores the plan in its own file; `gap run` every 5 minutes in market hours
+does the work. Long only. The user picks the names; do not pick for them.
+
+1. **Gap**: today's open (the first 5-minute IEX bar) is `--min-gap`% (3) or
+   more above yesterday's official close (Yahoo, not dividend-adjusted), and
+   at most `--max-gap`% if set. Huge gaps are often news; a cap skips them.
+2. **Entry**: the first 5-minute bar that closes above the high of the first
+   `--range` minutes (5), fresh (finished in the last 10 minutes), price
+   still above that high and not chasing. No new entries from
+   `--last-entry` (10:30 ET).
+3. **The order**: one bracket at Alpaca, stop just under the day's open
+   (`--stop open`; or `mid` / `low` of the range), take-profit at
+   `--target-r` (2) times the risk. Size: the smaller of `--dollars` (2000)
+   and `--max-loss` (100) / risk per share, whole shares.
+4. **Limits and exit**: as the breakout: `--max-trades` (3) a day, one per
+   name, never a name another strategy holds; everything sold by
+   `--flat-by` (15:55). Its trades are kept apart from the breakout's.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -288,6 +313,7 @@ as a Mac mini), with the user's own folder:
 0 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py dca run >> trader/bot/cron.log 2>&1
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py cc run >> trader/bot/cron.log 2>&1
 5 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rebal run >> trader/bot/cron.log 2>&1
+*/5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py gap run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to

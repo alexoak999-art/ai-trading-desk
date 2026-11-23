@@ -1164,6 +1164,85 @@ class Orb(InTmp):
         self.assertEqual((t.hour, t.utcoffset()), (10, datetime.timedelta(hours=-5)))
 
 
+GAP_BARS = [(100, 101, 99.5, 100.8), (100.8, 101.6, 100.7, 101.5)]  # opens 100; 9:35 bar closes above 101
+
+
+class Gap(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.prev = {"AAPL": 95.0, "MSFT": 99.0}
+        self._orig = bot.prev_close
+        bot.prev_close = lambda s, d: self.prev[s]
+        self.api = FakeOrb()
+        self.api.now = self.api.now.replace(hour=9, minute=45)
+        self.api.prices.update(AAPL=101.4, MSFT=101.4)
+        self.api.set_bars("AAPL", GAP_BARS)
+        self.api.set_bars("MSFT", GAP_BARS)
+
+    def tearDown(self):
+        bot.prev_close = self._orig
+        super().tearDown()
+
+    def test_gap_up_and_break_buys_with_stop_under_the_open(self):
+        run(self.api, "gap", "start", "AAPL", "MSFT")
+        rc, out = run(self.api, "gap", "run")
+        # gap = 100 / 95 - 1 = +5.3%; stop 99.99; risk 1.41; 19 shares by $2000; target 101.40 + 2.82
+        self.assertIn("AAPL: GAP-AND-GO, gap +5.3% (5-min close 101.50 > range high 101.00 at 09:35) -> BUY 19 "
+                      "at about 101.40; stop 99.99, target 104.22 (2R)", out)
+        self.assertIn("MSFT: gap +1.0% (open 100.00 vs 99.00 yesterday); needs +3% or more. No trade today.", out)
+        self.assertEqual(len(self.api.sent), 1)
+        with open("trader/bot/log.jsonl", encoding="utf-8") as fh:
+            self.assertIn('"event": "gap_entry"', fh.read())
+
+    def test_waits_for_the_first_range(self):
+        self.api.now = self.api.now.replace(minute=37)
+        run(self.api, "gap", "start", "AAPL")
+        rc, out = run(self.api, "gap", "run")
+        self.assertIn("Building the 5-minute opening range; the first breakout check is at 09:40", out)
+
+    def test_max_gap_and_last_entry(self):
+        run(self.api, "gap", "start", "AAPL", "--max-gap", "5")
+        rc, out = run(self.api, "gap", "run")
+        self.assertIn("AAPL: gap +5.3% (open 100.00 vs 95.00 yesterday); needs +3% to +5%. No trade today.", out)
+        run(self.api, "gap", "start", "AAPL")
+        self.api.now = self.api.now.replace(hour=10, minute=30)
+        rc, out = run(self.api, "gap", "run")
+        self.assertIn("Past the last entry time (10:30)", out)
+
+    def test_target_and_flat_by_reuse_the_breakout_engine(self):
+        run(self.api, "gap", "start", "AAPL")
+        run(self.api, "gap", "run")
+        self.api.move("AAPL", 104.5)
+        rc, out = run(self.api, "gap", "run")
+        self.assertIn("AAPL: TARGET HIT at about 104.22: +2.00R", out)
+        rc, out = run(self.api, "status")
+        self.assertIn("gap: on, watching AAPL; today (2026-11-23): AAPL closed; past trades 1", out)
+
+    def test_separate_from_the_breakout_and_others_keep_out(self):
+        run(self.api, "gap", "start", "AAPL")
+        run(self.api, "gap", "run")
+        self.assertFalse(os.path.exists(bot.ORB))
+        self.assertEqual(bot.strategy_symbols().get("AAPL"), "gap")
+        run(self.api, "orb", "start", "AAPL", "--range", "5")
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: held or traded by another strategy; skipped", out)
+
+    def test_dry_run_and_bad_settings(self):
+        rc, out = run(self.api, "--dry-run", "gap", "start", "AAPL")
+        self.assertIn("GAP-AND-GO", out)
+        self.assertIn("WOULD BUY 19", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.GAP))
+        rc, out = run(self.api, "gap", "start", "AAPL", "--min-gap", "4", "--max-gap", "3")
+        self.assertEqual(rc, 1)
+        self.assertIn("--max-gap above it", out)
+
+    def test_stop(self):
+        run(self.api, "gap", "start", "AAPL")
+        rc, out = run(self.api, "gap", "stop")
+        self.assertIn("Gap-and-go: no new trades", out)
+
+
 class PtrPath(unittest.TestCase):
     def setUp(self):
         self._env = dict(os.environ)
