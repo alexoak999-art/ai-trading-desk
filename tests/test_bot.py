@@ -536,6 +536,116 @@ class SwingSignal(unittest.TestCase):
         self.assertIn(s["verdict"], ("SETUP", "WATCH"))
 
 
+def bsig(rsi_prev=25.0, close=95.0, prev=94.0, ma20=100.0, ma200=110.0, rsi=29.0):
+    return {"close": close, "prev": prev, "rsi": rsi, "rsi_prev": rsi_prev, "ma20": ma20, "ma200": ma200}
+
+
+class Rsi(unittest.TestCase):
+    def test_wilder_by_hand(self):
+        # n=2: first changes +1, -1 -> avg gain .5, loss .5 -> 50; then +1 -> gain .75, loss .25 -> 75
+        self.assertEqual(bot.rsi_series([1, 2, 1, 2], 2), [None, None, 50.0, 75.0])
+
+    def test_extremes(self):
+        self.assertEqual(bot.rsi_series(list(range(1, 20)))[-1], 100.0)
+        self.assertEqual(bot.rsi_series(list(range(20, 1, -1)))[-1], 0.0)
+
+
+class Bounce(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.signals = {}
+        self._orig = bot.bounce_signal
+        bot.bounce_signal = lambda s: self.signals[s]
+        self.api = api = FakeAlpaca(cash=50000)
+        api.prices.update(AAPL=95.0, MSFT=400.0)
+
+    def tearDown(self):
+        bot.bounce_signal = self._orig
+        super().tearDown()
+
+    def test_buys_the_bounce_with_a_5pct_stop(self):
+        self.signals.update(AAPL=bsig(), MSFT=bsig(rsi_prev=41.0, rsi=43.0, close=400, prev=398))
+        run(self.api, "bounce", "start", "AAPL", "MSFT")
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("AAPL: BOUNCE -> BUY 21 at about 95.00; stop 90.25 at Alpaca (-5%)", out)
+        self.assertIn("MSFT: RSI 43.0 (yesterday 41.0); needs under 30 yesterday and an up close today", out)
+        self.assertEqual(self.api.sent[1]["stop_price"], 90.25)
+
+    def test_oversold_but_still_falling_is_not_a_bounce(self):
+        self.signals.update(AAPL=bsig(close=93.0, prev=94.0))
+        run(self.api, "bounce", "start", "AAPL")
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("no entry", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_sells_back_at_the_20_day_average(self):
+        self.signals.update(AAPL=bsig())
+        run(self.api, "bounce", "start", "AAPL")
+        run(self.api, "bounce", "run")
+        self.signals["AAPL"] = bsig(close=100.5, prev=99, ma20=100.2, rsi_prev=55, rsi=58)
+        self.api.prices["AAPL"] = 100.5
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("AAPL: SELL 21 at about 100.50: back at the 20-day average (100.50 >= 100.20). +5.8%", out)
+        self.assertIn("AAPL: closed on", out)  # cool-down starts right away
+
+    def test_time_exit_and_stop(self):
+        self.signals.update(AAPL=bsig())
+        run(self.api, "bounce", "start", "AAPL", "--hold-days", "14")
+        run(self.api, "bounce", "run")
+        self.signals["AAPL"] = bsig(close=96, prev=95.5, ma20=99, rsi_prev=35, rsi=36)
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("AAPL: holding 21, entry 95.00", out)
+        self.api.prices["AAPL"] = 90.0
+        self.api.trigger_stops()
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("AAPL: STOPPED OUT at about 90.25 (-5.0%", out)
+
+    def test_above_200_filter(self):
+        self.signals.update(AAPL=bsig(ma200=120.0))
+        run(self.api, "bounce", "start", "AAPL", "--above-200")
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("under the 200-day average 120.0 (--above-200)", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_does_not_buy_what_another_strategy_holds(self):
+        self.signals.update(AAPL=bsig())
+        self.api._fill("AAPL", 10, 95.0)  # e.g. the swing holds it
+        run(self.api, "bounce", "start", "AAPL")
+        rc, out = run(self.api, "bounce", "run")
+        self.assertIn("AAPL: BOUNCE, but you already hold it outside the bounce; skipped.", out)
+
+    def test_dry_run_and_status(self):
+        self.signals.update(AAPL=bsig())
+        rc, out = run(self.api, "--dry-run", "bounce", "start", "AAPL")
+        self.assertIn("AAPL: BOUNCE -> WOULD BUY 21", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.BOUNCE))
+        run(self.api, "bounce", "start", "AAPL")
+        run(self.api, "bounce", "run")
+        run(self.api, "bounce", "stop")
+        rc, out = run(self.api, "status")
+        self.assertIn("bounce: off, watching AAPL; open: AAPL 21 @ 95.00; closed trades 0", out)
+
+    def test_bad_settings_refused(self):
+        rc, out = run(self.api, "bounce", "start", "AAPL", "--stop", "150")
+        self.assertEqual(rc, 1)
+
+
+class BounceSignal(unittest.TestCase):
+    def test_reads_closes_through_trend(self):
+        tr = bot.trend_module()
+        orig = tr.load_chart
+        closes = [100.0] * 200 + [100 - i for i in range(1, 16)] + [86.0]  # a slide, then an up day
+        tr.load_chart = lambda s, offline=None, rng="2y": [("d%d" % i, c) for i, c in enumerate(closes)]
+        try:
+            s = bot.bounce_signal("ANY")
+        finally:
+            tr.load_chart = orig
+        self.assertLess(s["rsi_prev"], 30)
+        self.assertGreater(s["close"], s["prev"])
+        self.assertEqual(s["ma200"], round(sum(closes[-200:]) / 200, 2))
+
+
 ET = datetime.timezone(datetime.timedelta(hours=-5))
 
 

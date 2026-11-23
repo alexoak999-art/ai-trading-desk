@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs five rule-based strategies on a schedule: a
+  a one-share buy, then runs six rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -13,12 +13,15 @@ description: >-
   months or on a close below the average), and an opening-range breakout day
   trade (buy a fresh 5-minute close above the first 15 minutes' high, as a
   bracket order with the stop at the range midpoint and a 2R target, flat by
-  3:55 PM). Paper account only. Use when the user says "trading bot",
+  3:55 PM), and an oversold bounce (RSI 14 under 30 yesterday and an up close
+  today, 5% stop at Alpaca, sell back at the 20-day average or after ~2
+  weeks). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
-  breakout", "ORB", "day trade automatically", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | status]"
+  breakout", "ORB", "day trade automatically", "oversold bounce", "buy the
+  dip on RSI", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -176,6 +179,24 @@ work. Long only. The user picks the names; do not pick for them.
 `--dry-run orb start ...` previews what a run would do right now. Runs before
 the range is built, or after the last entry time, say so and do nothing new.
 
+## Step 5d: strategy 6, the oversold bounce
+
+The Day Trader scanner's "oversold bounce", traded: `bounce start SYMBOL ...`
+stores the list and rules; `bounce run` once a day near the close (about
+3:45 PM ET) does the work. Shares its position handling with the trend swing.
+The user picks the names; do not pick for them.
+
+1. **Entry**: RSI 14 (Wilder) was under 30 yesterday and today closes up
+   (the scanner's rule). With `--above-200`, only while the close is above
+   the 200-day average: without it, the rule also buys bounces in stocks
+   that are in a downtrend. Whole shares for about `--dollars` (2000).
+2. **Stop**: a GTC stop at Alpaca `--stop`% (5) below the fill.
+3. **Exits**: the stop fills; or a close back at or above the 20-day
+   average; or `--hold-days` (14, about 10 sessions) have passed.
+4. **Limits**: `--max-positions` (5); never a name another strategy holds or
+   trades; no rebuy for `--cooldown` days (10).
+5. `bounce stop` ends new buys; open positions keep their stops and exits.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -190,6 +211,7 @@ as a Mac mini), with the user's own folder:
 0 */2 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py copy run --member mccaul >> trader/bot/cron.log 2>&1
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py swing run >> trader/bot/cron.log 2>&1
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py orb run >> trader/bot/cron.log 2>&1
+45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py bounce run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to
