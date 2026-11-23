@@ -514,7 +514,7 @@ class Swing(InTmp):
         self.assertIn("AAPL: holding", out)
         self.assertNotIn("MSFT", out)
         rc, out = run(self.api, "status")
-        self.assertIn("swing: off on AAPL, MSFT; open: AAPL 10 @ 190.00", out)
+        self.assertIn("swing: off, watching AAPL, MSFT; open: AAPL 10 @ 190.00", out)
 
     def test_bad_settings_refused(self):
         rc, out = run(self.api, "swing", "start", "AAPL", "--stop", "0")

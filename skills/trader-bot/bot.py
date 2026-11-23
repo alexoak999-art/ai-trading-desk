@@ -1225,7 +1225,7 @@ def status(api, a):
             say("copy: %d trades copied so far" % len(st.get("trades", [])))
         elif f == "swing.json":
             closed = st.get("closed", [])
-            say("swing: %s on %s; open: %s; closed trades %d%s" % (
+            say("swing: %s, watching %s; open: %s; closed trades %d%s" % (
                 st.get("status"), ", ".join(st.get("symbols", [])),
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
