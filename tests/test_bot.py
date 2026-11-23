@@ -218,6 +218,8 @@ class Trail(InTmp):
         api.prices["TSLA"] = 100.0
         rc, out = run(api, "--dry-run", "trail", "start", "TSLA", "--qty", "10")
         self.assertIn("DRY RUN, not sent", out)
+        self.assertIn("would buy 10 TSLA", out)
+        self.assertNotIn("BOUGHT", out)
         self.assertEqual(api.sent, [])
         self.assertFalse(os.path.exists("trader/bot/trail-TSLA.json"))
 
@@ -293,6 +295,14 @@ class Wheel(InTmp):
 
     def open_short(self):
         return [p for p in self.api.positions() if p["asset_class"] == "us_option"]
+
+    def test_dry_run_start_previews_the_first_order(self):
+        os.remove("trader/bot/wheel-TSLA.json")
+        rc, out = run(self.api, "--dry-run", "wheel", "start", "TSLA")
+        self.assertIn("Preview of the first `wheel run`", out)
+        self.assertIn("SELL 1 PUT", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists("trader/bot/wheel-TSLA.json"))
 
     def test_sells_put_10pct_below_in_window(self):
         rc, out = run(self.api, "wheel", "run")
@@ -373,6 +383,59 @@ class Status(InTmp):
         self.assertEqual(rc, 0)
         self.assertIn("PAPER account", out)
         self.assertIn("trail TSLA: open", out)
+
+    def test_status_survives_a_long_log(self):
+        api = FakeAlpaca()
+        api.prices["TSLA"] = 100.0
+        run(api, "test-buy", "TSLA")
+        run(api, "trail", "start", "TSLA", "--qty", "1")
+        with open("trader/bot/log.jsonl", encoding="utf-8") as fh:
+            self.assertGreater(len(fh.readlines()), 1)
+        open("trader/bot/copy.json.tmp", "w").close()
+        rc, out = run(api, "status")
+        self.assertEqual(rc, 0)
+        self.assertIn("trail TSLA: open", out)
+
+
+class PtrPath(unittest.TestCase):
+    def setUp(self):
+        self._env = dict(os.environ)
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ.pop("TRADER_PELOSI_PTR", None)
+        os.environ["HOME"] = os.environ["USERPROFILE"] = self._tmp.name
+        os.environ["LOCALAPPDATA"] = os.path.join(self._tmp.name, "local")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+        self._tmp.cleanup()
+
+    def make(self, *parts):
+        p = os.path.join(self._tmp.name, *parts)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").close()
+        return p
+
+    def test_env_wins(self):
+        os.environ["TRADER_PELOSI_PTR"] = "x/ptr.py"
+        self.assertEqual(bot.default_ptr(), "x/ptr.py")
+
+    def test_finds_plugin_copy(self):
+        p = self.make(".claude", "plugins", "cache", "day-trader", "skills", "trader-pelosi", "ptr.py")
+        self.assertEqual(bot.default_ptr(), os.path.normpath(p))
+
+    def test_finds_desktop_app_copy(self):
+        p = self.make("local", "Claude-Data", "acct", "rpm", "a", "b", "plugin_1",
+                      "skills", "trader-pelosi", "ptr.py")
+        self.assertEqual(bot.default_ptr(), os.path.normpath(p))
+
+    def test_user_skill_folder_first(self):
+        self.make(".claude", "plugins", "x", "skills", "trader-pelosi", "ptr.py")
+        p = self.make(".claude", "skills", "trader-pelosi", "ptr.py")
+        self.assertEqual(os.path.normpath(bot.default_ptr()), os.path.normpath(p))
+
+    def test_missing_falls_back_to_skill_path(self):
+        self.assertTrue(bot.default_ptr().endswith(os.path.join("trader-pelosi", "ptr.py")))
 
 
 if __name__ == "__main__":

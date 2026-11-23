@@ -17,6 +17,7 @@ when the market is closed. Nothing here trades real money.
 """
 import argparse
 import datetime
+import glob
 import json
 import os
 import subprocess
@@ -168,8 +169,12 @@ def trail_start(api, a):
     if not a.dry_run:
         save(trail_path(sym), st)
     log("trail_start", symbol=sym, qty=a.qty, entry=st["entry"], floor=st["floor"], dry_run=a.dry_run)
-    say("BOUGHT %d %s at about %.2f (paper). Stop-loss order at Alpaca: %.2f (-%g%%)."
-        % (a.qty, sym, entry, st["floor"], a.stop))
+    if a.dry_run:
+        say("DRY RUN, nothing sent: would buy %d %s at about %.2f and place a stop-loss at %.2f (-%g%%)."
+            % (a.qty, sym, entry, st["floor"], a.stop))
+    else:
+        say("BOUGHT %d %s at about %.2f (paper). Stop-loss order at Alpaca: %.2f (-%g%%)."
+            % (a.qty, sym, entry, st["floor"], a.stop))
     say("Once it is up %g%% the stop trails %g%% below the highest price. Ladder: %s."
         % (a.trigger, a.trail, ", ".join("buy %d at -%g%%" % (l["qty"], l["drop_pct"]) for l in ladder) or "none"))
     return 0
@@ -231,7 +236,19 @@ def trail_run(api, a):
 # ---------------------------------------------------------------- strategy 2: copy Congress trades
 
 def default_ptr():
-    return os.environ.get("TRADER_PELOSI_PTR") or os.path.expanduser("~/.claude/skills/trader-pelosi/ptr.py")
+    """The Pelosi tracker: $TRADER_PELOSI_PTR, the user skills folder, or the newest copy
+    installed as a plugin (Claude Code plugins, or the Claude desktop app's plugin folder)."""
+    if os.environ.get("TRADER_PELOSI_PTR"):
+        return os.environ["TRADER_PELOSI_PTR"]
+    home = os.path.expanduser("~/.claude/skills/trader-pelosi/ptr.py")
+    if os.path.exists(home):
+        return home
+    found = glob.glob(os.path.expanduser("~/.claude/plugins/**/trader-pelosi/ptr.py"), recursive=True)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        found += glob.glob(os.path.join(local, "Claude-Data", "*", "rpm", "*", "*", "*",
+                                        "skills", "trader-pelosi", "ptr.py"))
+    return os.path.normpath(max(found, key=os.path.getmtime) if found else home)
 
 
 def copy_rows(data):
@@ -274,7 +291,8 @@ def copy_run(api, a):
     else:
         ptr = a.ptr or default_ptr()
         if not os.path.exists(ptr):
-            say("copy: the Pelosi tracker is not installed (%s). Install the Day Trader pack." % ptr)
+            say("copy: the Pelosi tracker is not installed (%s). Install the Day Trader pack, "
+                "or point to its ptr.py with --ptr or TRADER_PELOSI_PTR." % ptr)
             return 1
         cmd = [sys.executable, ptr, "new", "--read", "--json", "--state",
                os.path.join(DIR, "copy-ptr-state.json")] + sum([["--member", m] for m in a.member], [])
@@ -375,6 +393,9 @@ def wheel_start(api, a):
     say("Wheel on %s set: sell puts ~%g%% below the price, calls >= %g%% above your cost, %d-%d days out, "
         "close at %g%% profit, %d contract(s). `wheel run` does the work."
         % (sym, a.put_otm, a.call_over, lo, hi, a.take_profit, a.contracts))
+    if a.dry_run:
+        say("Preview of the first `wheel run` (nothing is saved or sent):")
+        say(wheel_step(api, st, datetime.date.today(), True))
     return 0
 
 
@@ -481,7 +502,7 @@ def wheel_step(api, st, today, dry):
     st["open"] = {"symbol": pick["symbol"], "kind": kind, "strike": pick["strike"],
                   "expiration": pick["expiration"], "credit": pick["limit"], "order_id": o.get("id"),
                   "status": "opening", "shares_before": shares}
-    log("wheel_sell", kind=kind, **pick)
+    log("wheel_sell", kind=kind, dry_run=dry, **pick)
     return "%s: SELL %d %s %s %.2f strike exp %s (%d days) at %.2f limit (bid %.2f / ask %.2f)." % (
         sym, n, kind.upper(), pick["symbol"], pick["strike"], pick["expiration"], pick["dte"],
         pick["limit"], pick["bid"], pick["ask"])
@@ -532,6 +553,8 @@ def status(api, a):
         say("  %-22s %8s @ %-9s now %-9s P/L %s" % (p["symbol"], p["qty"], p["avg_entry_price"],
                                                     p.get("current_price"), p.get("unrealized_pl")))
     for f in sorted(os.listdir(DIR)) if os.path.isdir(DIR) else []:
+        if not f.endswith(".json"):  # skip log.jsonl and leftover .tmp files
+            continue
         st = load(os.path.join(DIR, f))
         if f.startswith("trail-"):
             say("trail %s: %s, %d shares, entry %.2f, high %.2f, stop %.2f" % (
