@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs seven rule-based strategies on a schedule: a
+  a one-share buy, then runs eight rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -17,14 +17,16 @@ description: >-
   today, 5% stop at Alpaca, sell back at the 20-day average or after ~2
   weeks), and dollar-cost averaging (a fixed dollar amount split across
   chosen names weekly, every other week or monthly, fractional shares, no
-  selling: the buy-and-hold baseline). Paper account only. Use when the user says "trading bot",
+  selling: the buy-and-hold baseline), and covered calls only (calls on 100
+  shares you hold, 10% above the price and never below cost, bought back at
+  50% profit). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
   breakout", "ORB", "day trade automatically", "oversold bounce", "buy the
-  dip on RSI", "dollar-cost averaging", "DCA", "buy every week", or "how is
-  my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | status]"
+  dip on RSI", "dollar-cost averaging", "DCA", "buy every week", "covered calls
+  only", "sell calls on my shares", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -219,6 +221,31 @@ dates. The user picks the names and weights; do not pick for them.
 5. It keeps its own record of buys, so `status` shows dollars in and what
    they are worth now, even if another strategy trades the same name.
 
+## Step 5f: strategy 8, covered calls only
+
+The second half of the wheel on shares you hold, never selling puts:
+`cc start SYMBOL` stores the plan; `cc run` every 15 minutes in market hours
+does one step at a time (the same engine as the wheel). The user picks the
+name; do not pick for them.
+
+1. **Shares**: 100 per contract (`--contracts`, 1). Without them it refuses
+   and says what they would cost; `--buy-shares` buys the missing ones at
+   market first. It refuses a name another strategy trades or holds (its
+   shares could be called away from under that strategy), and the others
+   keep out of a covered-call name.
+2. **Strike**: at least `--otm`% (10) above today's price and `--over-cost`%
+   (0) above your cost, and never below cost. Expiry `--dte` (14-28) days
+   out, sold at the bid/ask midpoint.
+3. **Take profit**: buy back at `--take-profit`% (50) profit; sell the next
+   call on the following run.
+4. **Called away**: the cycle is recorded; it sells new calls only once 100
+   shares are held again.
+5. `cc stop SYMBOL`: no new calls; an open one is still managed.
+
+Tell the user what the numbers mean before starting: a call far above the
+price on a calm stock pays little (the preview shows the actual bid/ask), and
+a call that ends in the money sells the shares at the strike, capping the gain.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -235,6 +262,7 @@ as a Mac mini), with the user's own folder:
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py orb run >> trader/bot/cron.log 2>&1
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py bounce run >> trader/bot/cron.log 2>&1
 0 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py dca run >> trader/bot/cron.log 2>&1
+*/15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py cc run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to

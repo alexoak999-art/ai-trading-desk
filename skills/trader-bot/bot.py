@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
-day trade, an oversold bounce, and dollar-cost averaging. PAPER ACCOUNT ONLY.
+day trade, an oversold bounce, dollar-cost averaging, and covered calls.
+PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -22,6 +23,9 @@ day trade, an oversold bounce, and dollar-cost averaging. PAPER ACCOUNT ONLY.
   python bot.py dca start SPY:60 QQQ:40 --dollars 100 --every weekly --day mon [--cap 5000]
   python bot.py dca run                                 # once a day; buys only on its dates
   python bot.py dca stop                                # no more buys; holdings stay
+  python bot.py cc start AAPL --otm 10 --dte 14-28 --take-profit 50 [--buy-shares]
+  python bot.py cc run                                  # every 15 min in market hours
+  python bot.py cc stop AAPL                            # no new calls; the open one is still managed
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -460,7 +464,9 @@ def wheel_step(api, st, today, dry):
                 st["history"].append({"date": today.isoformat(), "event": "called away",
                                       "strike": op["strike"], "stock_gain": money(gain)})
                 st["cost_basis"] = None
-                msg = "CALLED AWAY at %.2f: stock gain %.2f. Back to selling puts." % (op["strike"], gain)
+                msg = "CALLED AWAY at %.2f: stock gain %.2f. %s" % (
+                    op["strike"], gain, "New calls once you hold 100 shares again." if st.get("mode") == "cc"
+                    else "Back to selling puts.")
             else:
                 st["history"].append({"date": today.isoformat(), "event": op["kind"] + " expired",
                                       "symbol": op["symbol"]})
@@ -485,13 +491,20 @@ def wheel_step(api, st, today, dry):
         return "%s: waiting on the %s order." % (sym, op["status"])
 
     # 3. nothing open: sell the next contract
+    if st.get("status") != "on":
+        return "%s: stopped; no new contracts." % sym
     lo = (today + datetime.timedelta(days=st["dte_min"])).isoformat()
     hi = (today + datetime.timedelta(days=st["dte_max"])).isoformat()
     if shares >= 100 * n:
         if st.get("cost_basis") is None:
             st["cost_basis"] = money(float(pos["avg_entry_price"]))
         target = st["cost_basis"] * (1 + st["call_over"] / 100)
+        if st.get("mode") == "cc":  # covered calls only: also --otm above today's price
+            target = max(target, api.last_price(sym) * (1 + st["call_otm"] / 100))
         kind, strike_lo, strike_hi = "call", max(target, st["cost_basis"]), None
+    elif st.get("mode") == "cc":
+        st["cost_basis"] = None
+        return "%s: you hold %d shares; %d covered call(s) need %d. Nothing to sell." % (sym, shares, n, 100 * n)
     else:
         price = api.last_price(sym)
         target = price * (1 - st["put_otm"] / 100)
@@ -537,6 +550,131 @@ def wheel_run(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 8: covered calls only
+
+def cc_path(sym):
+    return os.path.join(DIR, "cc-%s.json" % sym)
+
+
+def strategy_symbols():
+    """{symbol: strategy} for everything another bot strategy trades or holds."""
+    out = {}
+    for f in sorted(os.listdir(DIR)) if os.path.isdir(DIR) else []:
+        st = load(os.path.join(DIR, f)) if f.endswith(".json") else None
+        if not st:
+            continue
+        if f.startswith(("trail-", "wheel-")) and st.get("status") in ("open", "on"):
+            out[st["symbol"]] = f.split("-")[0]
+        elif f in ("swing.json", "bounce.json"):
+            out.update({s: f[:-5] for s in st.get("positions", {})})
+        elif f == "orb.json":
+            out.update({s: "orb" for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")})
+        elif f == "dca.json" and st.get("status") == "on":
+            out.update({s: "dca" for s in st.get("weights", {})})
+    return out
+
+
+class PretendShares:
+    """For a dry-run preview: Alpaca as it is, plus the shares --buy-shares would buy."""
+
+    def __init__(self, api, sym, qty, price):
+        self._api, self._sym, self._qty, self._price = api, sym, qty, price
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+    def position(self, sym):
+        if sym == self._sym:
+            return {"symbol": sym, "qty": str(self._qty), "avg_entry_price": str(self._price)}
+        return self._api.position(sym)
+
+
+def cc_start(api, a):
+    sym, n = a.symbol.upper(), a.contracts
+    other = strategy_symbols().get(sym)
+    if other:
+        say("cc: %s is traded by the %s strategy; covered calls could get its shares called away. "
+            "Pick another name." % (sym, other))
+        return 1
+    try:
+        lo, hi = (int(x) for x in a.dte.split("-"))
+    except ValueError:
+        say("cc: --dte is a range of days, e.g. 14-28")
+        return 1
+    if n < 1 or a.otm < 0 or a.over_cost < 0 or not 0 < a.take_profit < 100 or not 0 < lo <= hi:
+        say("cc: --contracts >= 1, --otm and --over-cost >= 0, --take-profit 1-99, --dte like 14-28")
+        return 1
+    st = load(cc_path(sym)) or {"symbol": sym, "premium_total": 0.0, "cost_basis": None,
+                                "open": None, "cycles": [], "history": []}
+    st.update(mode="cc", call_otm=a.otm, call_over=a.over_cost, put_otm=0, dte_min=lo, dte_max=hi,
+              take_profit=a.take_profit, contracts=n, status="on")
+    pos = api.position(sym)
+    shares, need = (int(float(pos["qty"])) if pos else 0), 100 * n
+    price = api.last_price(sym)
+    preview_api = api
+    if shares < need:
+        missing = need - shares
+        if not a.buy_shares:
+            say("cc: you hold %d %s; %d covered call(s) need %d. Buy the other %d first (about $%.0f), "
+                "or add --buy-shares." % (shares, sym, n, need, missing, missing * price))
+            return 1
+        cash = float(api.account().get("cash") or 0)
+        if missing * price > cash:
+            say("cc: %d %s cost about $%.0f and cash is $%.0f." % (missing, sym, missing * price, cash))
+            return 1
+        if not market_open(api):
+            return 1
+        o = wait_fill(api, api.submit_order(symbol=sym, qty=missing, side="buy", type="market",
+                                            time_in_force="day"))
+        log("cc_buy_shares", symbol=sym, qty=missing, price=o.get("filled_avg_price"), dry_run=a.dry_run)
+        say("%s %d %s at about %.2f (to have %d to cover)." % (
+            "WOULD BUY" if a.dry_run else "BOUGHT", missing, sym, float(o.get("filled_avg_price") or price), need))
+        if a.dry_run:
+            preview_api = PretendShares(api, sym, need, price)
+    if not a.dry_run:
+        save(cc_path(sym), st)
+    say("Covered calls on %s: sell %d call(s) %d-%d days out, strike at least %g%% above today's price and %g%% "
+        "above your cost, never below cost; buy back at %g%% profit, then sell the next. If the stock closes "
+        "above the strike at expiration, the shares are sold at the strike (called away). Puts are never sold. "
+        "`cc run` does the work."
+        % (sym, n, lo, hi, a.otm, a.over_cost, a.take_profit))
+    if a.dry_run:
+        say("Preview of the first `cc run` (nothing is saved or sent):")
+        say(wheel_step(preview_api, st, datetime.date.today(), True))
+    return 0
+
+
+def cc_run(api, a):
+    files = [f for f in sorted(os.listdir(DIR)) if f.startswith("cc-") and f.endswith(".json")] \
+        if os.path.isdir(DIR) else []
+    plans = [p for p in (load(os.path.join(DIR, f)) for f in files)
+             if p and (p.get("status") == "on" or p.get("open"))]
+    if not plans:
+        say("No covered-call plans. Start one with `cc start SYMBOL`.")
+        return 0
+    if not market_open(api):
+        return 0
+    for st in plans:
+        say(wheel_step(api, st, datetime.date.today(), a.dry_run))
+        if not a.dry_run:
+            save(cc_path(st["symbol"]), st)
+    return 0
+
+
+def cc_stop(api, a):
+    sym = a.symbol.upper()
+    st = load(cc_path(sym))
+    if not st:
+        say("No covered-call plan on %s." % sym)
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(cc_path(sym), st)
+    say("Covered calls on %s: no new calls.%s" % (sym, " The open call %s is still managed (bought back at %g%% "
+        "profit, or it expires or is assigned)." % (st["open"]["symbol"], st["take_profit"]) if st.get("open") else ""))
+    return 0
+
+
 # ---------------------------------------------------------------- strategy 4: trend swing
 
 SWING = os.path.join(DIR, "swing.json")
@@ -564,10 +702,10 @@ def swing_signal(sym):
 
 
 def other_bot_symbols():
-    """Symbols an open trailing-stop or wheel plan trades, so the swing keeps out of them."""
+    """Symbols an open trailing-stop, wheel or covered-call plan trades, so the others keep out of them."""
     out = set()
     for f in sorted(os.listdir(DIR)) if os.path.isdir(DIR) else []:
-        if f.startswith(("trail-", "wheel-")) and f.endswith(".json"):
+        if f.startswith(("trail-", "wheel-", "cc-")) and f.endswith(".json"):
             st = load(os.path.join(DIR, f)) or {}
             if st.get("status") in ("open", "on"):
                 out.add(st.get("symbol"))
@@ -1398,6 +1536,12 @@ def status(api, a):
                 st["symbol"], st["premium_total"], st.get("cost_basis"),
                 "%s %s (%s)" % (op["kind"], op["symbol"], op["status"]) if op else "nothing",
                 len(st["cycles"])))
+        elif f.startswith("cc-"):
+            op = st.get("open")
+            say("cc %s: %s; premiums so far $%.2f, cost basis %s, open: %s, called away %d time(s)" % (
+                st["symbol"], st.get("status"), st["premium_total"], st.get("cost_basis"),
+                "call %s %.2f exp %s (%s)" % (op["symbol"], op["strike"], op["expiration"], op["status"])
+                if op else "nothing", len(st["cycles"])))
         elif f == "copy.json":
             say("copy: %d trades copied so far" % len(st.get("trades", [])))
         elif f == "swing.json":
@@ -1520,6 +1664,19 @@ def parser():
     p.add_argument("--cap", type=float, help="stop after this many dollars in total")
     d.add_parser("run")
     d.add_parser("stop")
+
+    c = sub.add_parser("cc").add_subparsers(dest="sub", required=True)
+    p = c.add_parser("start")
+    p.add_argument("symbol")
+    p.add_argument("--contracts", type=int, default=1, help="calls to sell, 100 shares each (default 1)")
+    p.add_argument("--otm", type=float, default=10, help="strike at least this %% above today's price (default 10)")
+    p.add_argument("--over-cost", type=float, default=0, help="and this %% above your cost (default 0)")
+    p.add_argument("--dte", default="14-28", help="days to expiration window (default 14-28)")
+    p.add_argument("--take-profit", type=float, default=50, help="buy back at this %% profit (default 50)")
+    p.add_argument("--buy-shares", action="store_true", help="buy the missing shares at market first")
+    c.add_parser("run")
+    p = c.add_parser("stop")
+    p.add_argument("symbol")
     return ap
 
 
@@ -1538,7 +1695,8 @@ def main(argv=None, api=None):
           ("swing", "start"): swing_start, ("swing", "run"): swing_run, ("swing", "stop"): swing_stop,
           ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop,
           ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop,
-          ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop,
+          ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:

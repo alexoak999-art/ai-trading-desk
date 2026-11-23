@@ -374,6 +374,126 @@ class Wheel(InTmp):
         self.assertIn("SELL 1 PUT", out)
 
 
+class CoveredCalls(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = api = FakeAlpaca(cash=50000)
+        api.prices["TSLA"] = 250.0
+        for k in (240, 250, 260, 270, 280, 290):
+            for d in (7, 21, 35):
+                c = contract("call", k, d)
+                api.contracts.append(c)
+                api.quotes[c["symbol"]] = (4.8, 5.2)
+        for k in (220, 225):
+            c = contract("put", k, 21)
+            api.contracts.append(c)
+            api.quotes[c["symbol"]] = (4.8, 5.2)
+
+    def hold(self, qty=100, cost=240):
+        self.api.pos["TSLA"] = {"qty": str(qty), "avg_entry_price": str(cost), "asset_class": "us_equity"}
+
+    def st(self):
+        return bot.load(bot.cc_path("TSLA"))
+
+    def test_needs_100_shares_or_buy_shares(self):
+        rc, out = run(self.api, "cc", "start", "TSLA")
+        self.assertEqual(rc, 1)
+        self.assertIn("you hold 0 TSLA; 1 covered call(s) need 100. Buy the other 100 first (about $25000)", out)
+        rc, out = run(self.api, "cc", "start", "TSLA", "--buy-shares")
+        self.assertIn("BOUGHT 100 TSLA at about 250.00", out)
+        self.assertEqual(self.api.position("TSLA")["qty"], "100.0")
+
+    def test_sells_a_call_10pct_above_price_and_never_a_put(self):
+        self.hold(cost=240)
+        run(self.api, "cc", "start", "TSLA")
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("SELL 1 CALL", out)
+        self.assertIn("280.00 strike", out)  # >= 250 * 1.10 = 275, and >= cost 240
+        self.assertFalse(any("P00" in o.get("symbol", "") for o in self.api.sent))
+
+    def test_never_below_cost(self):
+        self.hold(cost=285)  # under water: cost above today's price + 10%
+        run(self.api, "cc", "start", "TSLA")
+        run(self.api, "cc", "run")
+        self.assertEqual(self.st()["open"]["strike"], 290)
+
+    def test_take_profit_then_next_call(self):
+        self.hold()
+        run(self.api, "cc", "start", "TSLA")
+        run(self.api, "cc", "run")
+        run(self.api, "cc", "run")  # reconcile -> open
+        occ = self.st()["open"]["symbol"]
+        self.api.quotes[occ] = (2.3, 2.4)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("BUYING TO CLOSE", out)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("bought back", out)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("SELL 1 CALL", out)
+
+    def test_called_away_then_waits_for_shares(self):
+        self.hold()
+        run(self.api, "cc", "start", "TSLA")
+        run(self.api, "cc", "run")
+        run(self.api, "cc", "run")
+        del self.api.pos[self.st()["open"]["symbol"]]
+        del self.api.pos["TSLA"]
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("CALLED AWAY at 280.00: stock gain 4000.00. New calls once you hold 100 shares again.", out)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("you hold 0 shares; 1 covered call(s) need 100. Nothing to sell.", out)
+        self.assertFalse(any("P00" in o.get("symbol", "") for o in self.api.sent))
+
+    def test_refuses_names_other_strategies_trade(self):
+        self.hold()
+        bot.save(bot.trail_path("TSLA"), {"symbol": "TSLA", "status": "open"})
+        rc, out = run(self.api, "cc", "start", "TSLA")
+        self.assertEqual(rc, 1)
+        self.assertIn("TSLA is traded by the trail strategy", out)
+        os.remove(bot.trail_path("TSLA"))
+        bot.save(bot.SWING, {"positions": {"TSLA": {}}, "closed": []})
+        rc, out = run(self.api, "cc", "start", "TSLA")
+        self.assertIn("traded by the swing strategy", out)
+
+    def test_other_strategies_keep_out_of_a_cc_name(self):
+        self.hold()
+        run(self.api, "cc", "start", "TSLA")
+        self.assertIn("TSLA", bot.other_bot_symbols())
+
+    def test_stop_keeps_managing_the_open_call(self):
+        self.hold()
+        run(self.api, "cc", "start", "TSLA")
+        run(self.api, "cc", "run")
+        run(self.api, "cc", "run")
+        rc, out = run(self.api, "cc", "stop", "TSLA")
+        self.assertIn("no new calls. The open call", out)
+        occ = self.st()["open"]["symbol"]
+        self.api.quotes[occ] = (2.3, 2.4)
+        n = len(self.api.sent)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("BUYING TO CLOSE", out)  # still managed after stop
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("bought back", out)
+        rc, out = run(self.api, "cc", "run")
+        self.assertIn("No covered-call plans", out)  # nothing open, nothing new
+        self.assertEqual(len(self.api.sent), n + 1)  # only the buy-back
+
+    def test_dry_run_with_buy_shares_previews_the_call(self):
+        rc, out = run(self.api, "--dry-run", "cc", "start", "TSLA", "--buy-shares")
+        self.assertIn("WOULD BUY 100 TSLA", out)
+        self.assertIn("SELL 1 CALL", out)
+        self.assertEqual([o for o in self.api.sent], [])
+        self.assertFalse(os.path.exists(bot.cc_path("TSLA")))
+
+    def test_status_line(self):
+        self.hold()
+        run(self.api, "cc", "start", "TSLA")
+        run(self.api, "cc", "run")
+        run(self.api, "cc", "run")
+        rc, out = run(self.api, "status")
+        self.assertIn("cc TSLA: on; premiums so far $500.00, cost basis 240.0, open: call", out)
+
+
 class Status(InTmp):
     def test_status_runs(self):
         api = FakeAlpaca()
