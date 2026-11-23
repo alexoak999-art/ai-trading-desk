@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
-day trade, and an oversold bounce. PAPER ACCOUNT ONLY.
+day trade, an oversold bounce, and dollar-cost averaging. PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -19,6 +19,9 @@ day trade, and an oversold bounce. PAPER ACCOUNT ONLY.
   python bot.py bounce start AAPL MSFT --dollars 2000 --stop 5 --hold-days 14 [--above-200]
   python bot.py bounce run                              # once a day, ~3:45 PM ET
   python bot.py bounce stop                             # no new buys; open ones still managed
+  python bot.py dca start SPY:60 QQQ:40 --dollars 100 --every weekly --day mon [--cap 5000]
+  python bot.py dca run                                 # once a day; buys only on its dates
+  python bot.py dca stop                                # no more buys; holdings stay
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -925,6 +928,180 @@ def bounce_stop(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 7: dollar-cost averaging
+
+DCA = os.path.join(DIR, "dca.json")
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri")
+
+
+def parse_weights(items):
+    """['SPY:60', 'QQQ:40'] or ['SPY', 'QQQ'] -> {'SPY': 0.6, 'QQQ': 0.4}."""
+    raw = {}
+    for it in items:
+        sym, _, w = it.partition(":")
+        raw[sym.upper()] = float(w) if w else 1.0
+    if any(w <= 0 for w in raw.values()):
+        raise ValueError("weights must be positive")
+    total = sum(raw.values())
+    return {s: w / total for s, w in raw.items()}
+
+
+def dca_next(st, after, inclusive):
+    """The next buy date on or after (inclusive) / strictly after `after`."""
+    d = after if inclusive else after + datetime.timedelta(days=1)
+    if st["every"] in ("weekly", "biweekly"):
+        want = WEEKDAYS.index(st["day"])
+        d += datetime.timedelta(days=(want - d.weekday()) % 7)
+        if st["every"] == "biweekly" and not inclusive:
+            d += datetime.timedelta(days=7)
+        return d
+    day = int(st["day"])
+    if d.day > day:
+        d = (d.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+    return d.replace(day=day)
+
+
+def dca_value(api, st):
+    """(dollars invested, value now, {sym: [shares, cost]}) from the strategy's own buys."""
+    held = {}
+    for b in st["buys"]:
+        if b["status"] == "filled":
+            h = held.setdefault(b["symbol"], [0.0, 0.0])
+            h[0] += b["qty"]
+            h[1] += b["qty"] * b["price"]
+    cost = sum(h[1] for h in held.values())
+    value = sum(h[0] * api.last_price(s) for s, h in held.items())
+    return cost, value, held
+
+
+def dca_step(api, st, today, dry):
+    out = []
+    # 1. settle buys that had not filled yet
+    for b in st["buys"]:
+        if b["status"] == "pending":
+            o = api.order(b["order_id"]) or {}
+            if o.get("status") == "filled":
+                b.update(status="filled", qty=float(o.get("filled_qty") or b["qty"]),
+                         price=float(o["filled_avg_price"]))
+            elif o.get("status") not in LIVE:
+                b["status"] = o.get("status", "unknown")
+                st["carry"][b["symbol"]] = st["carry"].get(b["symbol"], 0) + b["dollars"]
+                out.append("%s: the %s buy ended %s; its $%.2f goes into the next one." % (
+                    b["symbol"], b["date"], b["status"], b["dollars"]))
+    if st.get("status") != "on":
+        return out
+    nxt = datetime.date.fromisoformat(st["next"])
+    if today < nxt:
+        out.append("Next DCA buy on %s ($%g across %s)." % (st["next"], st["dollars"], ", ".join(st["weights"])))
+        return out
+    spent = sum(b["dollars"] for b in st["buys"] if b["status"] in ("filled", "pending"))
+    budget = st["dollars"]
+    if st.get("cap"):
+        budget = min(budget, st["cap"] - spent)
+        if budget < 1:
+            st["status"] = "done"
+            out.append("DCA reached its $%g cap; no more buys. What it bought stays put." % st["cap"])
+            return out
+    cash = float(api.account().get("cash") or 0)
+    if cash < budget:
+        out.append("DCA: $%.0f is due but cash is $%.0f; skipped this one." % (budget, cash))
+        st["next"] = dca_next(st, today, False).isoformat()
+        return out
+    for sym, w in st["weights"].items():
+        amt = round(budget * w + st["carry"].get(sym, 0), 2)
+        price = api.last_price(sym)
+        asset = api.asset(sym) or {}
+        if asset.get("fractionable") and amt >= 1:
+            order, qty = dict(notional=amt), amt / price
+        else:
+            qty = int(amt // price)
+            if qty < 1:
+                st["carry"][sym] = amt
+                out.append("%s: $%.2f buys no whole share at %.2f (not fractionable); carried to the next buy."
+                           % (sym, amt, price))
+                continue
+            order = dict(qty=qty)
+        o = wait_fill(api, api.submit_order(symbol=sym, side="buy", type="market", time_in_force="day", **order))
+        filled = o.get("status") in ("filled", "dry_run")
+        px = float(o.get("filled_avg_price") or price)
+        qty = float(o.get("filled_qty") or qty)
+        used = round(qty * px, 2) if "qty" in order else amt
+        st["carry"][sym] = round(amt - used, 2) if "qty" in order else 0
+        st["buys"].append({"date": today.isoformat(), "symbol": sym, "dollars": used, "qty": round(qty, 6),
+                           "price": money(px), "order_id": o.get("id"), "status": "filled" if filled else "pending"})
+        log("dca_buy", symbol=sym, dollars=used, qty=round(qty, 6), price=money(px), dry_run=dry)
+        out.append("%s: %s $%.2f = %s shares at about %.2f." % (
+            sym, "WOULD BUY" if dry else "BUY", used, ("%.4f" % qty).rstrip("0").rstrip("."), px))
+    st["next"] = dca_next(st, today, False).isoformat()
+    out.append("Next DCA buy on %s." % st["next"])
+    return out
+
+
+def dca_start(api, a):
+    try:
+        weights = parse_weights(a.symbols)
+    except ValueError as e:
+        say("dca: %s (use SYMBOL or SYMBOL:WEIGHT, e.g. SPY:60 QQQ:40)" % e)
+        return 1
+    errs = []
+    if a.dollars < 1:
+        errs.append("--dollars must be at least 1")
+    if a.every == "monthly":
+        if not (a.day.isdigit() and 1 <= int(a.day) <= 28):
+            errs.append("--day for monthly is a day of the month, 1-28")
+    elif a.day not in WEEKDAYS:
+        errs.append("--day for weekly/biweekly is one of %s" % ", ".join(WEEKDAYS))
+    if a.cap is not None and a.cap < a.dollars:
+        errs.append("--cap must be at least --dollars")
+    for e in errs:
+        say("dca: " + e)
+    if errs:
+        return 1
+    st = load(DCA) or {"buys": [], "carry": {}}
+    st.update(weights=weights, dollars=a.dollars, every=a.every, day=a.day, cap=a.cap, status="on")
+    st["next"] = dca_next(st, datetime.date.today(), True).isoformat()
+    if not a.dry_run:
+        save(DCA, st)
+    when = {"weekly": "every %s" % a.day.capitalize(), "biweekly": "every other %s" % a.day.capitalize(),
+            "monthly": "on day %s of each month" % a.day}[a.every]
+    say("Dollar-cost averaging: $%g %s into %s, at market, fractional shares where Alpaca allows. No stops and "
+        "no selling: it is the buy-and-hold baseline.%s First buy on %s." % (
+            a.dollars, when, ", ".join("%s %.0f%%" % (s, w * 100) for s, w in weights.items()),
+            " Stops after $%g in total." % a.cap if a.cap else "", st["next"]))
+    if a.dry_run:
+        say("Preview of a buy day (nothing is saved or sent):")
+        st["next"] = datetime.date.today().isoformat()
+        for m in dca_step(api, st, datetime.date.today(), True):
+            say(m)
+    return 0
+
+
+def dca_run(api, a):
+    st = load(DCA)
+    if not st or st.get("status") not in ("on",) and not any(b["status"] == "pending" for b in st.get("buys", [])):
+        say("No dollar-cost averaging plan%s." % (" running" if st else ". Start one with `dca start SYMBOL ...`"))
+        return 0
+    if not market_open(api):
+        return 0
+    for m in dca_step(api, st, datetime.date.today(), a.dry_run):
+        say(m)
+    if not a.dry_run:
+        save(DCA, st)
+    return 0
+
+
+def dca_stop(api, a):
+    st = load(DCA)
+    if not st:
+        say("No dollar-cost averaging plan.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(DCA, st)
+    say("Dollar-cost averaging stopped: no more buys. What it bought stays in the account.")
+    return 0
+
+
 # ---------------------------------------------------------------- strategy 5: opening-range breakout
 
 ORB = os.path.join(DIR, "orb.json")
@@ -1230,6 +1407,13 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
+        elif f == "dca.json":
+            cost, value, held = dca_value(api, st)
+            say("dca: %s, $%g %s into %s; next buy %s; invested $%.2f, worth $%.2f%s" % (
+                st.get("status"), st["dollars"], st["every"],
+                ", ".join("%s %.0f%%" % (s, w * 100) for s, w in st["weights"].items()),
+                st.get("next") if st.get("status") == "on" else "none", cost, value,
+                " (%+.1f%%)" % ((value / cost - 1) * 100) if cost else ""))
         elif f == "bounce.json":
             closed = st.get("closed", [])
             say("bounce: %s, watching %s; open: %s; closed trades %d%s" % (
@@ -1326,6 +1510,16 @@ def parser():
                    help="only buy bounces while the close is above the 200-day average")
     b.add_parser("run")
     b.add_parser("stop")
+
+    d = sub.add_parser("dca").add_subparsers(dest="sub", required=True)
+    p = d.add_parser("start")
+    p.add_argument("symbols", nargs="+", help="SYMBOL or SYMBOL:WEIGHT, e.g. SPY:60 QQQ:40")
+    p.add_argument("--dollars", type=float, default=100, help="dollars per buy day, split by weight (default 100)")
+    p.add_argument("--every", choices=("weekly", "biweekly", "monthly"), default="weekly")
+    p.add_argument("--day", default="mon", help="mon..fri for weekly/biweekly, 1-28 for monthly (default mon)")
+    p.add_argument("--cap", type=float, help="stop after this many dollars in total")
+    d.add_parser("run")
+    d.add_parser("stop")
     return ap
 
 
@@ -1343,7 +1537,8 @@ def main(argv=None, api=None):
           ("wheel", "start"): wheel_start, ("wheel", "run"): wheel_run,
           ("swing", "start"): swing_start, ("swing", "run"): swing_run, ("swing", "stop"): swing_stop,
           ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop,
-          ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop,
+          ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:

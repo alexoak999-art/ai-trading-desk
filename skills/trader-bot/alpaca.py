@@ -104,6 +104,10 @@ class Alpaca:
     def cancel_order(self, order_id):
         return self._req("DELETE", TRADING, "/v2/orders/" + order_id)
 
+    def asset(self, symbol):
+        """The asset record: tradable, fractionable, name ..."""
+        return self._req("GET", TRADING, "/v2/assets/" + urllib.parse.quote(symbol))
+
     # -------------------------------------------------------------- data
     def last_price(self, symbol):
         d = self._req("GET", DATA, "/v2/stocks/%s/trades/latest" % urllib.parse.quote(symbol),

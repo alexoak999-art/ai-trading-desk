@@ -646,6 +646,126 @@ class BounceSignal(unittest.TestCase):
         self.assertEqual(s["ma200"], round(sum(closes[-200:]) / 200, 2))
 
 
+class FakeDca(FakeAlpaca):
+    def __init__(self, cash=50000.0):
+        super().__init__(cash)
+        self.whole_only = set()
+
+    def asset(self, s):
+        return {"symbol": s, "tradable": True, "fractionable": s not in self.whole_only}
+
+
+class DcaDates(unittest.TestCase):
+    MON = datetime.date(2026, 11, 23)  # a Monday
+
+    def test_weekly(self):
+        st = {"every": "weekly", "day": "mon"}
+        self.assertEqual(bot.dca_next(st, self.MON, True), self.MON)
+        self.assertEqual(bot.dca_next(st, self.MON, False), datetime.date(2026, 11, 30))
+        st["day"] = "wed"
+        self.assertEqual(bot.dca_next(st, self.MON, True), datetime.date(2026, 11, 25))
+
+    def test_biweekly(self):
+        st = {"every": "biweekly", "day": "mon"}
+        self.assertEqual(bot.dca_next(st, self.MON, True), self.MON)
+        self.assertEqual(bot.dca_next(st, self.MON, False), datetime.date(2026, 12, 7))
+
+    def test_monthly_rolls_into_next_month_and_year(self):
+        st = {"every": "monthly", "day": "15"}
+        self.assertEqual(bot.dca_next(st, self.MON, True), datetime.date(2026, 12, 15))
+        self.assertEqual(bot.dca_next(st, datetime.date(2026, 12, 15), True), datetime.date(2026, 12, 15))
+        self.assertEqual(bot.dca_next(st, datetime.date(2026, 12, 15), False), datetime.date(2027, 1, 15))
+
+    def test_weights(self):
+        self.assertEqual(bot.parse_weights(["spy:60", "QQQ:40"]), {"SPY": 0.6, "QQQ": 0.4})
+        self.assertEqual(bot.parse_weights(["SPY", "QQQ"]), {"SPY": 0.5, "QQQ": 0.5})
+
+
+class Dca(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeDca()
+        self.api.prices.update(SPY=600.0, QQQ=500.0, BRK=700.0)
+
+    def due_today(self):
+        st = bot.load(bot.DCA)
+        st["next"] = TODAY.isoformat()
+        bot.save(bot.DCA, st)
+
+    def test_buys_fractional_by_weight_then_waits(self):
+        run(self.api, "dca", "start", "SPY:60", "QQQ:40", "--dollars", "100")
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("SPY: BUY $60.00 = 0.1 shares at about 600.00", out)
+        self.assertIn("QQQ: BUY $40.00 = 0.08 shares at about 500.00", out)
+        self.assertEqual([o.get("notional") for o in self.api.sent], [60.0, 40.0])
+        nxt = bot.load(bot.DCA)["next"]
+        self.assertGreater(nxt, TODAY.isoformat())
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("Next DCA buy on %s" % nxt, out)
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_whole_shares_carry_the_remainder(self):
+        self.api.whole_only.add("BRK")
+        run(self.api, "dca", "start", "BRK", "--dollars", "500")
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("BRK: $500.00 buys no whole share at 700.00 (not fractionable); carried", out)
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("BRK: BUY $700.00 = 1 shares", out)
+        self.assertEqual(bot.load(bot.DCA)["carry"]["BRK"], 300.0)
+
+    def test_cap_stops_buying(self):
+        run(self.api, "dca", "start", "SPY", "--dollars", "100", "--cap", "150")
+        self.due_today()
+        run(self.api, "dca", "run")
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("SPY: BUY $50.00", out)  # only what is left under the cap
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("reached its $150 cap", out)
+        self.assertEqual(bot.load(bot.DCA)["status"], "done")
+
+    def test_not_enough_cash_skips_to_next_date(self):
+        self.api.cash = 50
+        run(self.api, "dca", "start", "SPY", "--dollars", "100")
+        self.due_today()
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("$100 is due but cash is $50; skipped", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_status_shows_invested_and_value(self):
+        run(self.api, "dca", "start", "SPY", "--dollars", "120")
+        self.due_today()
+        run(self.api, "dca", "run")
+        self.api.prices["SPY"] = 660.0
+        rc, out = run(self.api, "status")
+        self.assertIn("dca: on, $120 weekly into SPY 100%", out)
+        self.assertIn("invested $120.00, worth $132.00 (+10.0%)", out)
+
+    def test_dry_run_and_bad_settings(self):
+        rc, out = run(self.api, "--dry-run", "dca", "start", "SPY", "QQQ")
+        self.assertIn("Preview of a buy day", out)
+        self.assertIn("SPY: WOULD BUY $50.00", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.DCA))
+        rc, out = run(self.api, "dca", "start", "SPY", "--every", "monthly", "--day", "31")
+        self.assertEqual(rc, 1)
+        rc, out = run(self.api, "dca", "start", "SPY:-1")
+        self.assertIn("weights must be positive", out)
+
+    def test_stop(self):
+        run(self.api, "dca", "start", "SPY")
+        rc, out = run(self.api, "dca", "stop")
+        self.assertIn("no more buys", out)
+        self.due_today()
+        st = bot.load(bot.DCA)
+        rc, out = run(self.api, "dca", "run")
+        self.assertIn("No dollar-cost averaging plan running", out)
+
+
 ET = datetime.timezone(datetime.timedelta(hours=-5))
 
 

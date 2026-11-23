@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs six rule-based strategies on a schedule: a
+  a one-share buy, then runs seven rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -15,13 +15,16 @@ description: >-
   bracket order with the stop at the range midpoint and a 2R target, flat by
   3:55 PM), and an oversold bounce (RSI 14 under 30 yesterday and an up close
   today, 5% stop at Alpaca, sell back at the 20-day average or after ~2
-  weeks). Paper account only. Use when the user says "trading bot",
+  weeks), and dollar-cost averaging (a fixed dollar amount split across
+  chosen names weekly, every other week or monthly, fractional shares, no
+  selling: the buy-and-hold baseline). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
   breakout", "ORB", "day trade automatically", "oversold bounce", "buy the
-  dip on RSI", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | status]"
+  dip on RSI", "dollar-cost averaging", "DCA", "buy every week", or "how is
+  my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -197,6 +200,25 @@ The user picks the names; do not pick for them.
    trades; no rebuy for `--cooldown` days (10).
 5. `bounce stop` ends new buys; open positions keep their stops and exits.
 
+## Step 5e: strategy 7, dollar-cost averaging
+
+The baseline the others are measured against: `dca start SYM[:WEIGHT] ...`
+stores the plan; `dca run` once a day (10:00 AM ET is fine) buys only on its
+dates. The user picks the names and weights; do not pick for them.
+
+1. **Buys**: `--dollars` (100) each buy day, split by weight (`SPY:60
+   QQQ:40`; no weights = equal), at market. Fractional (notional) orders
+   where Alpaca allows; otherwise whole shares, with the remainder carried
+   to the next buy.
+2. **Dates**: `--every weekly|biweekly|monthly`, `--day mon..fri` or `1-28`.
+   The first buy is on the first such day from today. A date the market is
+   closed is bought on the next run when it is open.
+3. **No stops, no selling.** `--cap` ends it after that many dollars;
+   `dca stop` ends it any time. What it bought stays.
+4. If cash is short on a buy day it skips to the next date and says so.
+5. It keeps its own record of buys, so `status` shows dollars in and what
+   they are worth now, even if another strategy trades the same name.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -212,6 +234,7 @@ as a Mac mini), with the user's own folder:
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py swing run >> trader/bot/cron.log 2>&1
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py orb run >> trader/bot/cron.log 2>&1
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py bounce run >> trader/bot/cron.log 2>&1
+0 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py dca run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to
