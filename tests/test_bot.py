@@ -536,6 +536,187 @@ class SwingSignal(unittest.TestCase):
         self.assertIn(s["verdict"], ("SETUP", "WATCH"))
 
 
+ET = datetime.timezone(datetime.timedelta(hours=-5))
+
+
+class FakeOrb(FakeAlpaca):
+    """Adds a clock with a New York timestamp, 5-minute bars, and bracket orders
+    whose stop and take-profit legs cancel each other."""
+
+    def __init__(self, cash=50000.0):
+        super().__init__(cash)
+        self.now = datetime.datetime(2026, 11, 23, 10, 0, tzinfo=ET)
+        self.bar_data = {}
+
+    def clock(self):
+        return dict(super().clock(), timestamp=self.now.isoformat(timespec="microseconds"))
+
+    def bars(self, s, start, end=None, timeframe="5Min"):
+        return [b for b in self.bar_data.get(s, []) if bot.parse_ts(b["t"]) < bot.parse_ts(end)]
+
+    def set_bars(self, s, rows, start="09:30"):
+        """rows: (o, h, l, c) per 5-minute bar from 9:30 ET."""
+        t0 = self.now.replace(hour=int(start[:2]), minute=int(start[3:]))
+        self.bar_data[s] = [{"t": (t0 + i * bot.BAR).astimezone(datetime.timezone.utc).isoformat()
+                                  .replace("+00:00", "Z"), "o": o, "h": h, "l": l, "c": c, "v": 1000}
+                            for i, (o, h, l, c) in enumerate(rows)]
+
+    def submit_order(self, **o):
+        if o.get("order_class") != "bracket":
+            return super().submit_order(**o)
+        base = {k: v for k, v in o.items() if k not in ("order_class", "take_profit", "stop_loss")}
+        parent = super().submit_order(**base)
+        legs = []
+        for kind, px in (("limit", o["take_profit"]["limit_price"]), ("stop", o["stop_loss"]["stop_price"])):
+            leg = {"id": self._id(), "symbol": o["symbol"], "qty": o["qty"], "side": "sell", "type": kind,
+                   "status": "new", ("limit_price" if kind == "limit" else "stop_price"): px}
+            self.orders[leg["id"]] = leg
+            legs.append(leg)
+        parent["legs"] = legs
+        self.sent[-1] = o
+        return parent
+
+    def move(self, s, price):
+        """Price moves; a bracket leg that is hit fills and cancels its sibling."""
+        self.prices[s] = price
+        for o in list(self.orders.values()):
+            for leg in o.get("legs") or []:
+                if leg["status"] != "new":
+                    continue
+                hit = (leg["type"] == "stop" and price <= float(leg["stop_price"])) or \
+                      (leg["type"] == "limit" and price >= float(leg["limit_price"]))
+                if hit:
+                    px = float(leg.get("stop_price") or leg.get("limit_price"))
+                    self._fill(s, -float(leg["qty"]), px)
+                    leg.update(status="filled", filled_avg_price=str(px))
+                    for other in o["legs"]:
+                        if other is not leg and other["status"] == "new":
+                            other["status"] = "canceled"
+
+
+RANGE = [(100, 101, 99.5, 100.5), (100.5, 101.5, 100, 101), (101, 102, 100.2, 101.2)]  # high 102, low 99.5
+
+
+class Orb(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeOrb()
+        self.api.prices.update(AAPL=102.3, MSFT=400.0)
+        run(self.api, "orb", "start", "AAPL", "MSFT")
+
+    def test_waits_while_the_range_builds(self):
+        self.api.now = self.api.now.replace(hour=9, minute=40)
+        self.api.set_bars("AAPL", RANGE[:2])
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("Building the 15-minute opening range; the first breakout check is at 09:50", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_breakout_buys_a_bracket_sized_by_risk(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])  # 9:45 bar closes above 102
+        self.api.set_bars("MSFT", RANGE)
+        rc, out = run(self.api, "orb", "run")
+        # stop = midpoint 100.75; risk 1.55 at 102.30 -> $100 / 1.55 = 64 shares; $2000 / 102.3 = 19 -> 19
+        self.assertIn("AAPL: BREAKOUT (5-min close 102.40 > range high 102.00 at 09:45) -> BUY 19 at about 102.30; "
+                      "stop 100.75, target 105.40 (2R)", out)
+        self.assertIn("MSFT: waiting. Range 99.50-102.00", out)
+        o = self.api.sent[0]
+        self.assertEqual((o["order_class"], o["time_in_force"]), ("bracket", "gtc"))
+        self.assertEqual((o["stop_loss"]["stop_price"], o["take_profit"]["limit_price"]), ("100.75", "105.40"))
+
+    def test_max_loss_caps_the_size(self):
+        run(self.api, "orb", "start", "AAPL", "--max-loss", "20", "--stop", "low")
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("BUY 7 at about 102.30; stop 99.50", out)  # $20 / 2.80 risk = 7 shares
+
+    def test_target_then_no_second_trade_in_the_name(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        self.api.set_bars("MSFT", RANGE)
+        run(self.api, "orb", "run")
+        self.api.move("AAPL", 105.5)
+        self.api.now = self.api.now.replace(minute=30)
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: TARGET HIT at about 105.40: +2.00R", out)
+        self.assertEqual(sum(1 for o in self.api.sent if o.get("symbol") == "AAPL"), 1)
+        st = bot.load(bot.ORB)
+        self.assertEqual(st["history"][0]["how"], "TARGET HIT")
+
+    def test_stop_out(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        run(self.api, "orb", "run")
+        self.api.move("AAPL", 100.0)
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: STOPPED OUT at about 100.75: -1.00R", out)
+
+    def test_flat_by_cancels_legs_and_sells(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        run(self.api, "orb", "run")
+        legs = self.api.sent and [o for o in self.api.orders.values() if o.get("legs")][0]["legs"]
+        self.api.prices["AAPL"] = 103.0
+        self.api.now = self.api.now.replace(hour=15, minute=55)
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: FLAT BY 15:55 at about 103.00", out)
+        self.assertTrue(all(l["status"] == "canceled" for l in legs))
+        self.assertIsNone(self.api.position("AAPL"))
+
+    def test_does_not_chase_or_enter_late(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        self.api.prices["AAPL"] = 103.5  # more than half a risk unit above 102
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("not chasing", out)
+        self.api.now = self.api.now.replace(hour=11, minute=30)
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("Past the last entry time (11:30)", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_stale_or_failed_breakouts_are_not_bought(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)] + [(102, 102.2, 101, 101.5)] * 4)
+        self.api.now = self.api.now.replace(minute=20)  # breakout bar 9:45-9:50 finished 30 min ago
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: the first breakout was the 09:45 bar, more than 10 minutes ago; missed", out)
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        self.api.now = self.api.now.replace(minute=0)
+        self.api.prices["AAPL"] = 101.9
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("AAPL: broke out at 09:45, but 101.90 is back at or below the range high 102.00", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_skips_names_other_strategies_hold(self):
+        bot.save(bot.trail_path("MSFT"), {"symbol": "MSFT", "status": "open"})
+        self.api.set_bars("AAPL", RANGE)
+        rc, out = run(self.api, "orb", "run")
+        self.assertIn("MSFT: held or traded by another strategy; skipped", out)
+
+    def test_dry_run_start_previews(self):
+        os.remove(bot.ORB)
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        self.api.set_bars("MSFT", RANGE)
+        rc, out = run(self.api, "--dry-run", "orb", "start", "AAPL", "MSFT")
+        self.assertIn("AAPL: BREAKOUT", out)
+        self.assertIn("WOULD BUY 19", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.ORB))
+
+    def test_bad_settings_refused(self):
+        rc, out = run(self.api, "orb", "start", "AAPL", "--range", "7", "--flat-by", "11:00")
+        self.assertEqual(rc, 1)
+        self.assertIn("--range must be 5 to 60", out)
+        self.assertIn("9:30 < --last-entry < --flat-by", out)
+
+    def test_status_line(self):
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        run(self.api, "orb", "run")
+        self.api.move("AAPL", 105.5)
+        run(self.api, "orb", "run")
+        rc, out = run(self.api, "status")
+        self.assertIn("orb: on, watching AAPL, MSFT; today (2026-11-23): AAPL closed; past trades 1, "
+                      "total $+58.90, avg +2.00R", out)
+
+    def test_parse_ts_handles_alpaca_nanoseconds(self):
+        t = bot.parse_ts("2026-11-23T10:00:00.123456789-05:00")
+        self.assertEqual((t.hour, t.utcoffset()), (10, datetime.timedelta(hours=-5)))
+
+
 class PtrPath(unittest.TestCase):
     def setUp(self):
         self._env = dict(os.environ)

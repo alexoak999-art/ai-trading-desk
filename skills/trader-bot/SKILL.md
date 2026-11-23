@@ -3,19 +3,22 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs four rule-based strategies on a schedule: a
+  a one-share buy, then runs five rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
   then covered calls never below cost, closed early at 50% profit), and a
   trend swing (buy when a stock is above a rising 200-day average and its
   3-month rate of change has reset near zero, stop at Alpaca, sell after ~3
-  months or on a close below the average). Paper account only. Use when the
-  user says "trading bot", "connect Alpaca", "paper trade automatically",
-  "trailing stop", "ladder in", "copy Pelosi", "copy Congress trades", "wheel
-  strategy", "sell puts", "covered calls", "trend swing", "swing trade the
-  200-day", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | status]"
+  months or on a close below the average), and an opening-range breakout day
+  trade (buy a fresh 5-minute close above the first 15 minutes' high, as a
+  bracket order with the stop at the range midpoint and a 2R target, flat by
+  3:55 PM). Paper account only. Use when the user says "trading bot",
+  "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
+  "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
+  "covered calls", "trend swing", "swing trade the 200-day", "opening range
+  breakout", "ORB", "day trade automatically", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -145,6 +148,34 @@ verdict for every name and the orders it would send. Before the market
 closes, Yahoo's daily bar is the latest price, so the signal can change by
 the close; that is why it runs near the close.
 
+## Step 5c: strategy 5, the opening-range breakout (day trade)
+
+The Day Trader pack's entry and exit rules, automated: `orb start SYMBOL ...`
+stores the list and rules; `orb run` every 5 minutes in market hours does the
+work. Long only. The user picks the names; do not pick for them.
+
+1. **Range**: the high and low of the first `--range` minutes (15), from
+   Alpaca's 5-minute bars (free IEX feed, so volume is partial).
+2. **Entry**: the first 5-minute bar that *closes* above the range high, if
+   that bar finished in the last 10 minutes and the price is still above the
+   high and not more than half a risk unit past it. A breakout that was
+   missed, or failed, is not bought later. No new entries from
+   `--last-entry` (11:30 ET).
+3. **The order**: one bracket at Alpaca: market buy, stop at the range
+   midpoint (`--stop mid`, or `low`), take-profit at `--target-r` (2) times
+   the risk. Both legs are held by the broker, so they work between runs.
+4. **Size**: whole shares, the smaller of `--dollars` (2000) and
+   `--max-loss` (100) divided by the risk per share. A stop too tight for the
+   spread is a refusal, not a smaller order.
+5. **Limits**: `--max-trades` (3) a day, one per name, never a name another
+   strategy holds or trades.
+6. **Flat by** `--flat-by` (15:55 ET): the run at that time cancels the legs
+   and sells at market. Anything left over (the PC was off) is sold on the
+   next run; the GTC legs protect it overnight.
+
+`--dry-run orb start ...` previews what a run would do right now. Runs before
+the range is built, or after the last entry time, say so and do nothing new.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -158,6 +189,7 @@ as a Mac mini), with the user's own folder:
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py wheel run >> trader/bot/cron.log 2>&1
 0 */2 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py copy run --member mccaul >> trader/bot/cron.log 2>&1
 45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py swing run >> trader/bot/cron.log 2>&1
+*/5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py orb run >> trader/bot/cron.log 2>&1
 ```
 
 On Windows, Task Scheduler does the same: one task per line, Monday to

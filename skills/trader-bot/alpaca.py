@@ -89,7 +89,8 @@ class Alpaca:
                          {"status": status, "symbols": symbols, "nested": "true", "limit": 500}) or []
 
     def order(self, order_id):
-        return self._req("GET", TRADING, "/v2/orders/" + order_id)
+        """One order; a bracket order comes with its stop and take-profit legs."""
+        return self._req("GET", TRADING, "/v2/orders/" + order_id, {"nested": "true"})
 
     def submit_order(self, **order):
         return self._req("POST", TRADING, "/v2/orders",
@@ -110,6 +111,18 @@ class Alpaca:
         if not d or "trade" not in d:
             raise AlpacaError("no price for %s" % symbol)
         return float(d["trade"]["p"])
+
+    def bars(self, symbol, start, end=None, timeframe="5Min"):
+        """Intraday bars, oldest first: [{t: UTC ISO start time, o, h, l, c, v}], free IEX feed."""
+        out, token = [], None
+        while True:
+            d = self._req("GET", DATA, "/v2/stocks/%s/bars" % urllib.parse.quote(symbol), {
+                "timeframe": timeframe, "start": start, "end": end, "feed": "iex",
+                "adjustment": "raw", "limit": 10000, "page_token": token}) or {}
+            out += d.get("bars") or []
+            token = d.get("next_page_token")
+            if not token:
+                return out
 
     def option_contracts(self, underlying, kind, exp_from, exp_to, strike_min=None, strike_max=None):
         out, token = [], None

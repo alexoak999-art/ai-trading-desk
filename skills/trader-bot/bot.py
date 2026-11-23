@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
-trades, the options wheel, and a 200-day trend swing. PAPER ACCOUNT ONLY.
+trades, the options wheel, a 200-day trend swing, and an opening-range breakout
+day trade. PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -12,6 +13,9 @@ trades, the options wheel, and a 200-day trend swing. PAPER ACCOUNT ONLY.
   python bot.py swing start AAPL MSFT NVDA --dollars 2000 --stop 10 --hold-days 91
   python bot.py swing run                               # once a day, ~3:45 PM ET
   python bot.py swing stop                              # no new buys; open ones still managed
+  python bot.py orb start AAPL NVDA --range 15 --stop mid --target-r 2 --max-loss 100
+  python bot.py orb run                                 # every 5 min in market hours
+  python bot.py orb stop                                # no new trades; open ones still flat by close
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -23,6 +27,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -773,6 +778,260 @@ def swing_stop(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 5: opening-range breakout
+
+ORB = os.path.join(DIR, "orb.json")
+BAR = datetime.timedelta(minutes=5)
+
+
+def parse_ts(s):
+    """An ISO time from Alpaca (any fraction digits, Z or an offset) -> aware datetime."""
+    return datetime.datetime.fromisoformat(re.sub(r"\.\d+", "", s).replace("Z", "+00:00"))
+
+
+def et_now(api):
+    """New York time, from Alpaca's clock (no time-zone database needed on Windows)."""
+    ts = (api.clock() or {}).get("timestamp")
+    if not ts:
+        raise alp.AlpacaError("Alpaca's clock gave no timestamp")
+    return parse_ts(ts)
+
+
+def at(now, hhmm):
+    h, m = (int(x) for x in hhmm.split(":"))
+    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def orb_range(bars, open_dt, range_min, now):
+    """Bars inside the opening range, and completed 5-minute bars after it."""
+    end = open_dt + datetime.timedelta(minutes=range_min)
+    inside, after = [], []
+    for b in bars:
+        t = parse_ts(b["t"])
+        if open_dt <= t < end:
+            inside.append(b)
+        elif t >= end and t + BAR <= now:
+            after.append(b)
+    return inside, after
+
+
+def orb_close(st, sym, t, px, how, dry):
+    risk = t["entry"] - t["stop"]
+    t.update(status="closed", exit=money(px), how=how, r=round((px - t["entry"]) / risk, 2) if risk > 0 else 0,
+             pnl=money((px - t["entry"]) * t["qty"]))
+    st["history"].append(dict(t, symbol=sym))
+    log("orb_exit", symbol=sym, qty=t["qty"], entry=t["entry"], exit=money(px), how=how, r=t["r"],
+        pnl=t["pnl"], dry_run=dry)
+    return "%s: %s at about %.2f: %+.2fR, $%+.2f." % (sym, how, px, t["r"], t["pnl"])
+
+
+def orb_step(api, st, now, dry):
+    out, today = [], now.date().isoformat()
+    if st.get("day") != today:  # a new session: keep anything still open, drop the rest
+        st["today"] = {s: t for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")}
+        st["day"] = today
+    trades = st["today"]
+    open_dt = at(now, "09:30")
+    flat_by, last_entry = at(now, st["flat_by"]), at(now, st["last_entry"])
+
+    # 1. today's trades: closed by the bracket? time to be flat?
+    for sym in sorted(trades):
+        t = trades[sym]
+        if t["status"] not in ("open", "buying"):
+            continue
+        parent = api.order(t["order_id"]) or {}
+        pos = api.position(sym)
+        qty = int(float(pos["qty"])) if pos else 0
+        if t["status"] == "buying":
+            if parent.get("status") == "filled":
+                t.update(status="open", entry=money(float(parent["filled_avg_price"])))
+            elif parent.get("status") in LIVE and now < flat_by:
+                out.append("%s: waiting for the entry to fill." % sym)
+                continue
+            elif parent.get("status") in LIVE:
+                api.cancel_order(t["order_id"])
+                t["status"] = "canceled"
+                out.append("%s: entry never filled; canceled at the flat-by time." % sym)
+                continue
+            else:
+                t["status"] = "canceled"
+                out.append("%s: the entry order ended %s; no trade." % (sym, parent.get("status", "unknown")))
+                continue
+        if qty <= 0:
+            px, how = t["stop"], "closed"
+            for leg in parent.get("legs") or []:
+                if leg.get("status") == "filled":
+                    px = float(leg.get("filled_avg_price") or px)
+                    how = "TARGET HIT" if leg.get("type") == "limit" else "STOPPED OUT"
+            out.append(orb_close(st, sym, t, px, how, dry))
+            continue
+        if now >= flat_by or t["day"] != today:
+            for leg in parent.get("legs") or []:
+                if leg.get("status") in LIVE:
+                    api.cancel_order(leg["id"])
+                    wait_canceled(api, leg["id"], dry)
+            if not dry:
+                pos = api.position(sym)
+                qty = int(float(pos["qty"])) if pos else 0
+                if qty <= 0:
+                    continue  # a leg filled first; the next run records it
+            o = wait_fill(api, api.submit_order(symbol=sym, qty=qty, side="sell", type="market",
+                                                time_in_force="day"))
+            px = float(o.get("filled_avg_price") or api.last_price(sym))
+            out.append(orb_close(st, sym, t, px, "FLAT BY %s" % st["flat_by"] if t["day"] == today
+                                 else "LEFT OVER FROM %s, SOLD" % t["day"], dry))
+            continue
+        price = api.last_price(sym)
+        out.append("%s: in the trade, %d @ %.2f, now %.2f (%+.2fR); stop %.2f, target %.2f at Alpaca." % (
+            sym, qty, t["entry"], price, (price - t["entry"]) / (t["entry"] - t["stop"]), t["stop"], t["target"]))
+
+    # 2. new entries
+    if st.get("status") != "on":
+        return out
+    waiting = [s for s in st["symbols"] if s not in trades]
+    if not waiting:
+        return out
+    range_end = open_dt + datetime.timedelta(minutes=st["range_min"])
+    if now < range_end + BAR:
+        out.append("Building the %d-minute opening range; the first breakout check is at %s."
+                   % (st["range_min"], (range_end + BAR).strftime("%H:%M")))
+        return out
+    if now >= last_entry:
+        out.append("Past the last entry time (%s); no new trades today." % st["last_entry"])
+        return out
+    taken = len(trades)
+    busy = other_bot_symbols()
+    cash = float(api.account().get("cash") or 0)
+    for sym in waiting:
+        if taken >= st["max_trades"]:
+            out.append("%d trades taken today (the max); no more." % st["max_trades"])
+            break
+        if sym in busy or api.position(sym):
+            out.append("%s: held or traded by another strategy; skipped." % sym)
+            continue
+        inside, after = orb_range(api.bars(sym, open_dt.isoformat(), now.isoformat()), open_dt,
+                                  st["range_min"], now)
+        if not inside:
+            out.append("%s: no bars in the opening range (IEX feed); skipped." % sym)
+            continue
+        hi, lo = max(float(b["h"]) for b in inside), min(float(b["l"]) for b in inside)
+        brk = next((b for b in after if float(b["c"]) > hi), None)
+        if not brk:
+            last = float(after[-1]["c"]) if after else float(inside[-1]["c"])
+            out.append("%s: waiting. Range %.2f-%.2f; last 5-min close %.2f (%.2f below the high)."
+                       % (sym, lo, hi, last, hi - last))
+            continue
+        stop = money((hi + lo) / 2 if st["stop_at"] == "mid" else lo)
+        brk_t = parse_ts(brk["t"]).astimezone(now.tzinfo)
+        brk_at = brk_t.strftime("%H:%M")
+        if brk_t + BAR < now - 2 * BAR:
+            out.append("%s: the first breakout was the %s bar, more than 10 minutes ago; missed, no entry today."
+                       % (sym, brk_at))
+            continue
+        price = api.last_price(sym)
+        if price <= hi:
+            out.append("%s: broke out at %s, but %.2f is back at or below the range high %.2f; no entry."
+                       % (sym, brk_at, price, hi))
+            continue
+        risk = price - stop
+        if risk <= max(0.02, price * 0.001):
+            out.append("%s: broke out at %s, but the stop %.2f is too close to %.2f to survive the spread."
+                       % (sym, brk_at, stop, price))
+            continue
+        if price > hi + 0.5 * (hi - stop):
+            out.append("%s: broke out at %s, but %.2f is more than half a risk unit above the high %.2f; "
+                       "not chasing." % (sym, brk_at, price, hi))
+            continue
+        qty = min(int(st["dollars"] // price), int(st["max_loss"] // risk))
+        if qty < 1:
+            out.append("%s: breakout, but $%g of risk with a %.2f stop buys no whole share."
+                       % (sym, st["max_loss"], risk))
+            continue
+        if qty * price > cash:
+            out.append("%s: breakout, but %d shares need $%.0f and cash is $%.0f." % (sym, qty, qty * price, cash))
+            continue
+        target = money(price + st["target_r"] * risk)
+        o = wait_fill(api, api.submit_order(
+            symbol=sym, qty=qty, side="buy", type="market", time_in_force="gtc", order_class="bracket",
+            take_profit={"limit_price": "%.2f" % target}, stop_loss={"stop_price": "%.2f" % stop}))
+        filled = o.get("status") in ("filled", "dry_run")
+        entry = money(float(o.get("filled_avg_price") or price))
+        trades[sym] = {"day": today, "qty": qty, "entry": entry, "stop": stop, "target": target,
+                       "order_id": o.get("id"), "range": [money(lo), money(hi)], "breakout": brk_at,
+                       "status": "open" if filled else "buying"}
+        taken, cash = taken + 1, cash - qty * entry
+        log("orb_entry", symbol=sym, qty=qty, entry=entry, stop=stop, target=target, range_high=money(hi),
+            range_low=money(lo), dry_run=dry)
+        out.append("%s: BREAKOUT (5-min close %.2f > range high %.2f at %s) -> %s %d at about %.2f; stop %.2f, "
+                   "target %.2f (%gR) held at Alpaca; risk $%.0f; flat by %s." % (
+                       sym, float(brk["c"]), hi, brk_at, "WOULD BUY" if dry else "BUY", qty, entry, stop,
+                       target, st["target_r"], qty * risk, st["flat_by"]))
+    return out
+
+
+def orb_start(api, a):
+    syms = sorted({s.upper() for s in a.symbols})
+    errs = []
+    if a.range % 5 or not 5 <= a.range <= 60:
+        errs.append("--range must be 5 to 60 minutes, in steps of 5")
+    if a.target_r <= 0 or a.dollars <= 0 or a.max_loss <= 0 or a.max_trades < 1:
+        errs.append("--target-r, --dollars, --max-loss and --max-trades must be positive")
+    try:
+        le, fb = (datetime.time(*(int(x) for x in v.split(":"))) for v in (a.last_entry, a.flat_by))
+        if not datetime.time(9, 30) < le < fb <= datetime.time(16, 0):
+            errs.append("times must run 9:30 < --last-entry < --flat-by <= 16:00")
+    except ValueError:
+        errs.append("--last-entry and --flat-by are HH:MM, New York time")
+    for e in errs:
+        say("orb: " + e)
+    if errs:
+        return 1
+    st = load(ORB) or {"today": {}, "history": [], "day": None}
+    st.update(symbols=syms, range_min=a.range, stop_at=a.stop, target_r=a.target_r, dollars=a.dollars,
+              max_loss=a.max_loss, max_trades=a.max_trades, last_entry=a.last_entry, flat_by=a.flat_by,
+              status="on")
+    if not a.dry_run:
+        save(ORB, st)
+    say("Opening-range breakout on %s: the range is the first %d minutes; buy when a 5-minute bar closes above "
+        "its high (until %s), stop at the range %s, target %gR, as one bracket order at Alpaca. Up to $%g a "
+        "trade and $%g of risk, %d trades a day, one per name, long only. Everything is sold by %s."
+        % (", ".join(syms), a.range, a.last_entry, "midpoint" if a.stop == "mid" else "low", a.target_r,
+           a.dollars, a.max_loss, a.max_trades, a.flat_by))
+    if a.dry_run:
+        say("Preview of a `orb run` now (nothing is saved or sent):")
+        for m in orb_step(api, st, et_now(api), True):
+            say(m)
+    return 0
+
+
+def orb_run(api, a):
+    st = load(ORB)
+    if not st or (st.get("status") != "on" and not any(
+            t["status"] in ("open", "buying") for t in (st.get("today") or {}).values())):
+        say("No opening-range plan. Start one with `orb start SYMBOL ...`.")
+        return 0
+    if not market_open(api):
+        return 0
+    for m in orb_step(api, st, et_now(api), a.dry_run):
+        say(m)
+    if not a.dry_run:
+        save(ORB, st)
+    return 0
+
+
+def orb_stop(api, a):
+    st = load(ORB)
+    if not st:
+        say("No opening-range plan.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(ORB, st)
+    say("Opening-range breakout: no new trades. Anything open keeps its bracket and is still sold by %s."
+        % st["flat_by"])
+    return 0
+
+
 # ---------------------------------------------------------------- check / status
 
 def check(api, a):
@@ -824,6 +1083,14 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
+        elif f == "orb.json":
+            hist = st.get("history", [])
+            say("orb: %s, watching %s; today (%s): %s; past trades %d%s" % (
+                st.get("status"), ", ".join(st.get("symbols", [])), st.get("day"),
+                ", ".join("%s %s" % (s, t["status"]) for s, t in sorted((st.get("today") or {}).items()))
+                or "none", len(hist),
+                ", total $%+.2f, avg %+.2fR" % (sum(t["pnl"] for t in hist), sum(t["r"] for t in hist) / len(hist))
+                if hist else ""))
     return 0
 
 
@@ -878,6 +1145,20 @@ def parser():
     p.add_argument("--cooldown", type=int, default=21, help="days before rebuying a name it closed (default 21)")
     s.add_parser("run")
     s.add_parser("stop")
+
+    o = sub.add_parser("orb").add_subparsers(dest="sub", required=True)
+    p = o.add_parser("start")
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--range", type=int, default=15, help="opening range, minutes (default 15)")
+    p.add_argument("--stop", choices=("mid", "low"), default="mid", help="stop at the range midpoint or low")
+    p.add_argument("--target-r", type=float, default=2, help="target, in multiples of the risk (default 2)")
+    p.add_argument("--dollars", type=float, default=2000, help="most dollars in one trade (default 2000)")
+    p.add_argument("--max-loss", type=float, default=100, help="most dollars lost at the stop (default 100)")
+    p.add_argument("--max-trades", type=int, default=3, help="trades a day at most (default 3)")
+    p.add_argument("--last-entry", default="11:30", help="no new entries from this time, ET (default 11:30)")
+    p.add_argument("--flat-by", default="15:55", help="sell everything by this time, ET (default 15:55)")
+    o.add_parser("run")
+    o.add_parser("stop")
     return ap
 
 
@@ -893,7 +1174,8 @@ def main(argv=None, api=None):
     fn = {("check", None): check, ("status", None): status, ("test-buy", None): test_buy,
           ("trail", "start"): trail_start, ("trail", "run"): trail_run, ("copy", "run"): copy_run,
           ("wheel", "start"): wheel_start, ("wheel", "run"): wheel_run,
-          ("swing", "start"): swing_start, ("swing", "run"): swing_run, ("swing", "stop"): swing_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("swing", "start"): swing_start, ("swing", "run"): swing_run, ("swing", "stop"): swing_stop,
+          ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
