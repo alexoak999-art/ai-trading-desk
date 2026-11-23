@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
-trades, the options wheel, a 200-day trend swing, and an opening-range breakout
-day trade. PAPER ACCOUNT ONLY.
+trades, the options wheel, a 200-day trend swing, an opening-range breakout
+day trade, and an oversold bounce. PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -16,6 +16,9 @@ day trade. PAPER ACCOUNT ONLY.
   python bot.py orb start AAPL NVDA --range 15 --stop mid --target-r 2 --max-loss 100
   python bot.py orb run                                 # every 5 min in market hours
   python bot.py orb stop                                # no new trades; open ones still flat by close
+  python bot.py bounce start AAPL MSFT --dollars 2000 --stop 5 --hold-days 14 [--above-200]
+  python bot.py bounce run                              # once a day, ~3:45 PM ET
+  python bot.py bounce stop                             # no new buys; open ones still managed
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -577,35 +580,45 @@ def wait_canceled(api, oid, dry, seconds=10):
         time.sleep(0.5)
 
 
-def swing_close(st, sym, today, px, reason, dry):
+def daily_close(st, sym, today, px, reason, dry, name):
     p = st["positions"].pop(sym)
     ret = (px / p["entry"] - 1) * 100
     st["closed"].append({"symbol": sym, "qty": p["qty"], "entry": p["entry"], "exit": money(px),
                          "opened": p["opened"], "closed": today.isoformat(), "ret_pct": round(ret, 2),
                          "reason": reason})
-    log("swing_sell", symbol=sym, qty=p["qty"], entry=p["entry"], exit=money(px), reason=reason, dry_run=dry)
+    log(name + "_sell", symbol=sym, qty=p["qty"], entry=p["entry"], exit=money(px), reason=reason, dry_run=dry)
     return ret
 
 
-def swing_place_stop(api, st, sym, p, qty):
+def place_stop(api, st, sym, p, qty):
     p["stop"] = money(p["entry"] * (1 - st["stop_pct"] / 100))
     so = api.submit_order(symbol=sym, qty=qty, side="sell", type="stop",
                           stop_price=p["stop"], time_in_force="gtc")
     p["stop_order_id"], p["qty"] = so.get("id"), qty
 
 
-def swing_step(api, st, today, dry):
-    """One pass: manage what is held, then buy fresh SETUPs. Returns messages."""
-    out, held_map = [], st["positions"]
+class Daily:
+    """What differs between the strategies that hold for days: their name, the
+    word for a buy signal, the entry rule and the exit rule.
+      entry(sym) -> (True, info dict) or (False, why-not text); may raise
+      exit(sym, p) -> reason text or None; may raise (then it holds)"""
 
-    # 1. what the swing holds
+    def __init__(self, name, label, entry, exit):
+        self.name, self.label, self.entry, self.exit = name, label, entry, exit
+
+
+def daily_step(api, st, today, dry, strat):
+    """One pass: manage what the strategy holds, then buy fresh signals. Returns messages."""
+    out, held_map, name, label = [], st["positions"], strat.name, strat.label
+
+    # 1. what it holds
     for sym in sorted(held_map):
         p = held_map[sym]
         if p.get("status") == "buying":
             o = api.order(p["buy_order_id"]) or {}
             if o.get("status") == "filled":
                 p.update(entry=money(float(o["filled_avg_price"])), status="open")
-                swing_place_stop(api, st, sym, p, int(float(o.get("filled_qty") or p["qty"])))
+                place_stop(api, st, sym, p, int(float(o.get("filled_qty") or p["qty"])))
                 out.append("%s: buy filled at %.2f; stop %.2f placed at Alpaca." % (sym, p["entry"], p["stop"]))
             elif o.get("status") in LIVE:
                 out.append("%s: waiting for the buy order to fill." % sym)
@@ -619,22 +632,19 @@ def swing_step(api, st, today, dry):
             o = api.order(p["stop_order_id"]) if p.get("stop_order_id") else None
             stopped = bool(o) and o.get("status") == "filled"
             px = float((o or {}).get("filled_avg_price") or p["stop"])
-            ret = swing_close(st, sym, today, px, "stop filled" if stopped else "position gone", dry)
+            ret = daily_close(st, sym, today, px, "stop filled" if stopped else "position gone", dry, name)
             out.append("%s: %s at about %.2f (%+.1f%% vs entry %.2f). Closed." % (
                 sym, "STOPPED OUT" if stopped else "position is gone", px, ret, p["entry"]))
             continue
         age = (today - datetime.date.fromisoformat(p["opened"])).days
-        reason, s = None, None
         if age >= st["hold_days"]:
             reason = "held %d days (limit %d)" % (age, st["hold_days"])
         else:
             try:
-                s = swing_signal(sym)
+                reason = strat.exit(sym, p)
             except Exception as e:  # no data today: keep holding, the stop still protects
-                out.append("%s: no trend data (%s); holding, stop still at Alpaca." % (sym, e))
+                out.append("%s: no price data (%s); holding, stop still at Alpaca." % (sym, e))
                 continue
-            if s and not s["above_ma"]:
-                reason = "closed below the 200-day average (%.2f < %.2f)" % (s["close"], s["ma"])
         if reason:
             if p.get("stop_order_id"):
                 api.cancel_order(p["stop_order_id"])
@@ -647,13 +657,13 @@ def swing_step(api, st, today, dry):
             o = wait_fill(api, api.submit_order(symbol=sym, qty=qty, side="sell", type="market",
                                                 time_in_force="day"))
             px = float(o.get("filled_avg_price") or api.last_price(sym))
-            ret = swing_close(st, sym, today, px, reason, dry)
+            ret = daily_close(st, sym, today, px, reason, dry, name)
             out.append("%s: %s %d at about %.2f: %s. %+.1f%% vs entry %.2f." % (
                 sym, "WOULD SELL" if dry else "SELL", qty, px, reason, ret, p["entry"]))
             continue
         o = api.order(p["stop_order_id"]) if p.get("stop_order_id") else None
         if not (o and o.get("status") in LIVE):
-            swing_place_stop(api, st, sym, p, qty)
+            place_stop(api, st, sym, p, qty)
             out.append("%s: stop order was missing; placed one for %d at %.2f." % (sym, qty, p["stop"]))
         elif int(float(o.get("qty") or 0)) != qty:
             ro = api.replace_order(p["stop_order_id"], qty=qty)
@@ -681,46 +691,66 @@ def swing_step(api, st, today, dry):
             out.append("%s: skipped, a trailing-stop or wheel plan already trades it." % sym)
             continue
         try:
-            s = swing_signal(sym)
+            ok, info = strat.entry(sym)
         except Exception as e:
-            out.append("%s: no trend data (%s)." % (sym, e))
+            out.append("%s: no price data (%s)." % (sym, e))
             continue
-        if not s:
-            out.append("%s: not enough history for the 200-day rule." % sym)
-            continue
-        if s["verdict"] != "SETUP":
-            out.append("%s: %s (%s), no entry." % (sym, s["verdict"], trend_module().why(s)))
+        if not ok:
+            out.append("%s: %s, no entry." % (sym, info))
             continue
         if slots <= 0:
-            out.append("%s: SETUP, but %d swing positions are open (the max)." % (sym, st["max_positions"]))
+            out.append("%s: %s, but %d %s positions are open (the max)." % (sym, label, st["max_positions"], name))
             continue
         if api.position(sym):
-            out.append("%s: SETUP, but you already hold it outside the swing; skipped." % sym)
+            out.append("%s: %s, but you already hold it outside the %s; skipped." % (sym, label, name))
             continue
         price = api.last_price(sym)
         qty = int(st["dollars"] // price)
         if qty < 1:
-            out.append("%s: SETUP, but $%g buys no whole share at %.2f." % (sym, st["dollars"], price))
+            out.append("%s: %s, but $%g buys no whole share at %.2f." % (sym, label, st["dollars"], price))
             continue
         if qty * price > cash:
-            out.append("%s: SETUP, but %d shares need $%.0f and cash is $%.0f." % (sym, qty, qty * price, cash))
+            out.append("%s: %s, but %d shares need $%.0f and cash is $%.0f." % (
+                sym, label, qty, qty * price, cash))
             continue
         o = wait_fill(api, api.submit_order(symbol=sym, qty=qty, side="buy", type="market",
                                             time_in_force="day"))
         p = {"qty": qty, "entry": money(float(o.get("filled_avg_price") or price)),
              "opened": today.isoformat(), "stop": None, "stop_order_id": None, "status": "open"}
         if o.get("status") in ("filled", "dry_run"):
-            swing_place_stop(api, st, sym, p, qty)
+            place_stop(api, st, sym, p, qty)
         else:
             p.update(status="buying", buy_order_id=o.get("id"))
         held_map[sym], cash, slots = p, cash - qty * p["entry"], slots - 1
-        log("swing_buy", symbol=sym, qty=qty, entry=p["entry"], stop=p["stop"], roc=s["roc"],
-            pct_over_ma=s["pct_over_ma"], dry_run=dry)
+        log(name + "_buy", symbol=sym, qty=qty, entry=p["entry"], stop=p["stop"], dry_run=dry, **info)
         sell_by = (today + datetime.timedelta(days=st["hold_days"])).isoformat()
-        out.append("%s: SETUP -> %s %d at about %.2f; stop %s at Alpaca (-%g%%); sell by %s." % (
-            sym, "WOULD BUY" if dry else "BUY", qty, p["entry"],
+        out.append("%s: %s -> %s %d at about %.2f; stop %s at Alpaca (-%g%%); sell by %s." % (
+            sym, label, "WOULD BUY" if dry else "BUY", qty, p["entry"],
             "%.2f" % p["stop"] if p["stop"] else "placed once it fills", st["stop_pct"], sell_by))
     return out
+
+
+def swing_entry(sym):
+    s = swing_signal(sym)
+    if not s:
+        return False, "not enough history for the 200-day rule"
+    if s["verdict"] != "SETUP":
+        return False, "%s (%s)" % (s["verdict"], trend_module().why(s))
+    return True, {"roc": s["roc"], "pct_over_ma": s["pct_over_ma"]}
+
+
+def swing_exit(sym, p):
+    s = swing_signal(sym)
+    if s and not s["above_ma"]:
+        return "closed below the 200-day average (%.2f < %.2f)" % (s["close"], s["ma"])
+    return None
+
+
+SWING_RULES = Daily("swing", "SETUP", lambda s: swing_entry(s), lambda s, p: swing_exit(s, p))
+
+
+def swing_step(api, st, today, dry):
+    return daily_step(api, st, today, dry, SWING_RULES)
 
 
 def swing_start(api, a):
@@ -775,6 +805,123 @@ def swing_stop(api, a):
         save(SWING, st)
     say("Trend swing: no new buys. %d open position(s) keep their stops and exit rules; "
         "`swing run` still manages them." % len(st["positions"]))
+    return 0
+
+
+# ---------------------------------------------------------------- strategy 6: oversold bounce
+
+BOUNCE = os.path.join(DIR, "bounce.json")
+
+
+def rsi_series(closes, n=14):
+    """Wilder's RSI over n sessions, same as the Day Trader scanner. None until
+    there are n price changes."""
+    out = [None] * len(closes)
+    if len(closes) <= n:
+        return out
+    ch = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    ag = sum(max(c, 0) for c in ch[:n]) / n
+    al = sum(max(-c, 0) for c in ch[:n]) / n
+
+    def rsi(g, l):
+        return 100.0 if l == 0 else 100 - 100 / (1 + g / l)
+    out[n] = rsi(ag, al)
+    for i in range(n + 1, len(closes)):
+        c = ch[i - 1]
+        ag = (ag * (n - 1) + max(c, 0)) / n
+        al = (al * (n - 1) + max(-c, 0)) / n
+        out[i] = rsi(ag, al)
+    return out
+
+
+def bounce_signal(sym):
+    """Daily closes from Yahoo (today's bar is the latest price until the close):
+    RSI 14 today and yesterday, the 20- and 200-day averages."""
+    closes = [c for _, c in trend_module().load_chart(sym, None, "2y")]
+    if len(closes) < 30:
+        return None
+    r = rsi_series(closes)
+    return {"close": round(closes[-1], 2), "prev": round(closes[-2], 2),
+            "rsi": None if r[-1] is None else round(r[-1], 1),
+            "rsi_prev": None if r[-2] is None else round(r[-2], 1),
+            "ma20": round(sum(closes[-20:]) / 20, 2),
+            "ma200": round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None}
+
+
+def bounce_rules(st):
+    def entry(sym):
+        s = bounce_signal(sym)
+        if not s or s["rsi_prev"] is None:
+            return False, "not enough history for RSI 14"
+        if not (s["rsi_prev"] < 30 and s["close"] > s["prev"]):
+            return False, "RSI %.1f (yesterday %.1f); needs under 30 yesterday and an up close today (%.2f vs %.2f)" % (
+                s["rsi"], s["rsi_prev"], s["close"], s["prev"])
+        if st.get("above_200") and not (s["ma200"] and s["close"] > s["ma200"]):
+            return False, "oversold bounce, but %.2f is under the 200-day average %s (--above-200)" % (
+                s["close"], s["ma200"])
+        return True, {"rsi": s["rsi"], "rsi_prev": s["rsi_prev"], "ma20": s["ma20"]}
+
+    def exit(sym, p):
+        s = bounce_signal(sym)
+        if s and s["close"] >= s["ma20"]:
+            return "back at the 20-day average (%.2f >= %.2f)" % (s["close"], s["ma20"])
+        return None
+    return Daily("bounce", "BOUNCE", entry, exit)
+
+
+def bounce_start(api, a):
+    syms = sorted({s.upper() for s in a.symbols})
+    errs = []
+    if not 0 < a.stop < 100:
+        errs.append("--stop must be between 0 and 100 (percent below entry)")
+    if a.dollars <= 0 or a.hold_days < 1 or a.max_positions < 1 or a.cooldown < 0:
+        errs.append("--dollars, --hold-days and --max-positions must be positive, --cooldown 0 or more")
+    for e in errs:
+        say("bounce: " + e)
+    if errs:
+        return 1
+    trend_module()  # the price history comes through trader-agents' trend.py
+    st = load(BOUNCE) or {"positions": {}, "closed": []}
+    st.update(symbols=syms, dollars=a.dollars, stop_pct=a.stop, hold_days=a.hold_days,
+              max_positions=a.max_positions, cooldown_days=a.cooldown, above_200=a.above_200, status="on")
+    if not a.dry_run:
+        save(BOUNCE, st)
+    say("Oversold bounce on %s: when RSI 14 was under 30 yesterday and today closes up%s, buy about $%g with a "
+        "stop %g%% below at Alpaca. Sell when it closes back at its 20-day average, or after %d days. At most %d "
+        "at a time; no rebuy for %d days. `bounce run` does the work, once a day near the close."
+        % (", ".join(syms), " while above its 200-day average" if a.above_200 else "", a.dollars, a.stop,
+           a.hold_days, a.max_positions, a.cooldown))
+    if a.dry_run:
+        say("Preview of the first `bounce run` (nothing is saved or sent):")
+        for m in daily_step(api, st, datetime.date.today(), True, bounce_rules(st)):
+            say(m)
+    return 0
+
+
+def bounce_run(api, a):
+    st = load(BOUNCE)
+    if not st or (st.get("status") != "on" and not st.get("positions")):
+        say("No oversold-bounce plan. Start one with `bounce start SYMBOL ...`.")
+        return 0
+    if not market_open(api):
+        return 0
+    for m in daily_step(api, st, datetime.date.today(), a.dry_run, bounce_rules(st)):
+        say(m)
+    if not a.dry_run:
+        save(BOUNCE, st)
+    return 0
+
+
+def bounce_stop(api, a):
+    st = load(BOUNCE)
+    if not st:
+        say("No oversold-bounce plan.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(BOUNCE, st)
+    say("Oversold bounce: no new buys. %d open position(s) keep their stops and exit rules; "
+        "`bounce run` still manages them." % len(st["positions"]))
     return 0
 
 
@@ -1083,6 +1230,13 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
+        elif f == "bounce.json":
+            closed = st.get("closed", [])
+            say("bounce: %s, watching %s; open: %s; closed trades %d%s" % (
+                st.get("status"), ", ".join(st.get("symbols", [])),
+                ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
+                or "nothing", len(closed),
+                " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
         elif f == "orb.json":
             hist = st.get("history", [])
             say("orb: %s, watching %s; today (%s): %s; past trades %d%s" % (
@@ -1159,6 +1313,19 @@ def parser():
     p.add_argument("--flat-by", default="15:55", help="sell everything by this time, ET (default 15:55)")
     o.add_parser("run")
     o.add_parser("stop")
+
+    b = sub.add_parser("bounce").add_subparsers(dest="sub", required=True)
+    p = b.add_parser("start")
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--dollars", type=float, default=2000, help="dollars per position, whole shares (default 2000)")
+    p.add_argument("--stop", type=float, default=5, help="stop-loss, %% below entry (default 5)")
+    p.add_argument("--hold-days", type=int, default=14, help="sell after this many days (default 14, ~10 sessions)")
+    p.add_argument("--max-positions", type=int, default=5, help="open bounce positions at most (default 5)")
+    p.add_argument("--cooldown", type=int, default=10, help="days before rebuying a name it closed (default 10)")
+    p.add_argument("--above-200", action="store_true",
+                   help="only buy bounces while the close is above the 200-day average")
+    b.add_parser("run")
+    b.add_parser("stop")
     return ap
 
 
@@ -1175,7 +1342,8 @@ def main(argv=None, api=None):
           ("trail", "start"): trail_start, ("trail", "run"): trail_run, ("copy", "run"): copy_run,
           ("wheel", "start"): wheel_start, ("wheel", "run"): wheel_run,
           ("swing", "start"): swing_start, ("swing", "run"): swing_run, ("swing", "stop"): swing_stop,
-          ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("orb", "start"): orb_start, ("orb", "run"): orb_run, ("orb", "stop"): orb_stop,
+          ("bounce", "start"): bounce_start, ("bounce", "run"): bounce_run, ("bounce", "stop"): bounce_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
