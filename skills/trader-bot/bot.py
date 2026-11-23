@@ -627,8 +627,12 @@ def cc_start(api, a):
         o = wait_fill(api, api.submit_order(symbol=sym, qty=missing, side="buy", type="market",
                                             time_in_force="day"))
         log("cc_buy_shares", symbol=sym, qty=missing, price=o.get("filled_avg_price"), dry_run=a.dry_run)
-        say("%s %d %s at about %.2f (to have %d to cover)." % (
-            "WOULD BUY" if a.dry_run else "BOUGHT", missing, sym, float(o.get("filled_avg_price") or price), need))
+        if a.dry_run or o.get("status") == "filled":
+            say("%s %d %s at about %.2f (to have %d to cover)." % (
+                "WOULD BUY" if a.dry_run else "BOUGHT", missing, sym, float(o.get("filled_avg_price") or price), need))
+        else:
+            say("ORDERED %d %s at market; %s filled so far (%s). `cc run` sells the call once all %d are in." % (
+                missing, sym, o.get("filled_qty") or 0, o.get("status"), need))
         if a.dry_run:
             preview_api = PretendShares(api, sym, need, price)
     if not a.dry_run:
