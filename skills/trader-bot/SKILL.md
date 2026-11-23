@@ -3,16 +3,19 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs three rule-based strategies on a schedule: a
+  a one-share buy, then runs four rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
-  then covered calls never below cost, closed early at 50% profit). Paper
-  account only. Use when the user says "trading bot", "connect Alpaca",
-  "paper trade automatically", "trailing stop", "ladder in", "copy Pelosi",
-  "copy Congress trades", "wheel strategy", "sell puts", "covered calls", or
-  "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | status]"
+  then covered calls never below cost, closed early at 50% profit), and a
+  trend swing (buy when a stock is above a rising 200-day average and its
+  3-month rate of change has reset near zero, stop at Alpaca, sell after ~3
+  months or on a close below the average). Paper account only. Use when the
+  user says "trading bot", "connect Alpaca", "paper trade automatically",
+  "trailing stop", "ladder in", "copy Pelosi", "copy Congress trades", "wheel
+  strategy", "sell puts", "covered calls", "trend swing", "swing trade the
+  200-day", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -119,6 +122,29 @@ step at a time:
 Tell the user what one contract needs: a $250 stock means $25,000 of cash
 held for the put.
 
+## Step 5b: strategy 4, the trend swing
+
+The `/trader-agents` technical rule, traded: `swing start SYMBOL ...` stores
+the list and rules; `swing run` once a day near the close (about 3:45 PM ET)
+does the work. It needs the trader-agents skill installed next to this one
+(it imports its `trend.py`). The user picks the names; do not pick for them.
+
+1. **Entry**: a name's verdict is SETUP: above a rising 200-day average, and
+   its 63-day rate of change peaked at +15% or more, then reset to within 5%
+   of zero. Buys whole shares for about `--dollars` (2000) at market.
+2. **Stop**: a real GTC stop at Alpaca `--stop`% (10) below the fill.
+3. **Exits**: the stop fills; or a close below the 200-day average; or
+   `--hold-days` (91, about 3 months) have passed. Market sell, stop cancelled.
+4. **Limits**: at most `--max-positions` (5) open; never a name an open
+   trailing-stop or wheel plan trades, or one held outside the swing; no
+   rebuy of a name it closed for `--cooldown` days (21).
+5. `swing stop` ends new buys; open positions keep their stops and exits.
+
+Show the plan and `--dry-run swing start ...` first: it previews today's
+verdict for every name and the orders it would send. Before the market
+closes, Yahoo's daily bar is the latest price, so the signal can change by
+the close; that is why it runs near the close.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -131,7 +157,12 @@ as a Mac mini), with the user's own folder:
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py trail run >> trader/bot/cron.log 2>&1
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py wheel run >> trader/bot/cron.log 2>&1
 0 */2 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py copy run --member mccaul >> trader/bot/cron.log 2>&1
+45 15 * * 1-5   cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py swing run >> trader/bot/cron.log 2>&1
 ```
+
+On Windows, Task Scheduler does the same: one task per line, Monday to
+Friday, running `pythonw.exe` on a small launcher in the trading folder that
+calls `bot.py` and appends to `trader/bot/cron.log` (no window opens).
 
 Or a Claude Desktop scheduled task with the same command, which uses tokens on
 every run. For a daily report, a scheduled task after 4:00 PM ET that runs

@@ -397,6 +397,145 @@ class Status(InTmp):
         self.assertIn("trail TSLA: open", out)
 
 
+def sig(verdict="SETUP", close=100.0, ma=90.0):
+    above = close > ma
+    return {"close": close, "ma": ma, "pct_over_ma": round((close / ma - 1) * 100, 2),
+            "ma_slope_pct": 2.0 if verdict != "NO" else -2.0, "roc": 1.0 if verdict == "SETUP" else 12.0,
+            "roc_peak": 25.0, "above_ma": above, "ma_rising": verdict != "NO", "ran": True,
+            "reset": verdict == "SETUP", "verdict": verdict}
+
+
+class Swing(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.signals = {}
+        self._orig = bot.swing_signal
+        bot.swing_signal = lambda s: self.signals[s]
+        self.api = api = FakeAlpaca(cash=50000)
+        api.prices.update(AAPL=190.0, MSFT=400.0, NVDA=120.0)
+
+    def tearDown(self):
+        bot.swing_signal = self._orig
+        super().tearDown()
+
+    def start(self, *extra):
+        return run(self.api, "swing", "start", "AAPL", "MSFT", "--dollars", "2000", *extra)
+
+    def test_setup_buys_whole_shares_with_a_gtc_stop(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("WATCH"))
+        self.start()
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: SETUP -> BUY 10 at about 190.00; stop 171.00", out)
+        self.assertIn("MSFT: WATCH", out)
+        buy, stop = self.api.sent
+        self.assertEqual((buy["side"], buy["qty"], buy["type"]), ("buy", 10, "market"))
+        self.assertEqual((stop["type"], stop["stop_price"], stop["time_in_force"]), ("stop", 171.0, "gtc"))
+        st = bot.load(bot.SWING)
+        self.assertEqual(st["positions"]["AAPL"]["qty"], 10)
+
+    def test_holds_then_stops_out(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("NO", 300, 350))
+        self.start()
+        run(self.api, "swing", "run")
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: holding 10, entry 190.00", out)
+        self.assertEqual(len(self.api.sent), 2)  # nothing new
+        self.api.prices["AAPL"] = 170.0
+        self.api.trigger_stops()
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: STOPPED OUT at about 171.00 (-10.0%", out)
+        self.assertIn("AAPL: closed on %s; no new buy before %s" % (
+            TODAY.isoformat(), (TODAY + datetime.timedelta(days=21)).isoformat()), out)
+        st = bot.load(bot.SWING)
+        self.assertEqual(st["positions"], {})
+        self.assertEqual(st["closed"][0]["reason"], "stop filled")
+        self.assertIsNone(self.api.position("AAPL"))
+
+    def test_trend_break_cancels_stop_and_sells(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("WATCH"))
+        self.start()
+        run(self.api, "swing", "run")
+        stop_id = bot.load(bot.SWING)["positions"]["AAPL"]["stop_order_id"]
+        self.signals["AAPL"] = sig("NO", 180, 185)
+        self.api.prices["AAPL"] = 180.0
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: SELL 10 at about 180.00: closed below the 200-day average", out)
+        self.assertEqual(self.api.orders[stop_id]["status"], "canceled")
+        self.assertIsNone(self.api.position("AAPL"))
+
+    def test_time_exit_after_hold_days(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("WATCH"))
+        self.start("--hold-days", "91")
+        run(self.api, "swing", "run")
+        st = bot.load(bot.SWING)
+        st["positions"]["AAPL"]["opened"] = (TODAY - datetime.timedelta(days=92)).isoformat()
+        bot.save(bot.SWING, st)
+        self.api.prices["AAPL"] = 209.0
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("held 92 days (limit 91)", out)
+        self.assertIn("+10.0% vs entry 190.00", out)
+
+    def test_max_positions_and_other_strategies_are_respected(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("SETUP"), NVDA=sig("SETUP"))
+        bot.save(bot.trail_path("NVDA"), {"symbol": "NVDA", "status": "open"})
+        run(self.api, "swing", "start", "AAPL", "MSFT", "NVDA", "--max-positions", "1")
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: SETUP -> BUY", out)
+        self.assertIn("MSFT: SETUP, but 1 swing positions are open (the max)", out)
+        self.assertIn("NVDA: skipped, a trailing-stop or wheel plan already trades it", out)
+
+    def test_not_enough_cash_or_dollars(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("SETUP"))
+        run(self.api, "swing", "start", "AAPL", "MSFT", "--dollars", "300")
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("MSFT: SETUP, but $300 buys no whole share at 400.00", out)
+        self.api = FakeAlpaca(cash=100)
+        self.api.prices.update(AAPL=190.0, MSFT=400.0)
+        os.remove(bot.SWING)
+        run(self.api, "swing", "start", "AAPL", "--dollars", "300")
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: SETUP, but 1 shares need $190 and cash is $100", out)
+
+    def test_dry_run_start_previews_and_saves_nothing(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("WATCH"))
+        rc, out = run(self.api, "--dry-run", "swing", "start", "AAPL", "MSFT")
+        self.assertIn("Preview of the first `swing run`", out)
+        self.assertIn("AAPL: SETUP -> WOULD BUY 10", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.SWING))
+
+    def test_stop_keeps_managing_open_positions(self):
+        self.signals.update(AAPL=sig("SETUP"), MSFT=sig("SETUP"))
+        run(self.api, "swing", "start", "AAPL", "MSFT", "--max-positions", "1")
+        run(self.api, "swing", "run")
+        rc, out = run(self.api, "swing", "stop")
+        self.assertIn("no new buys. 1 open position(s)", out)
+        rc, out = run(self.api, "swing", "run")
+        self.assertIn("AAPL: holding", out)
+        self.assertNotIn("MSFT", out)
+        rc, out = run(self.api, "status")
+        self.assertIn("swing: off on AAPL, MSFT; open: AAPL 10 @ 190.00", out)
+
+    def test_bad_settings_refused(self):
+        rc, out = run(self.api, "swing", "start", "AAPL", "--stop", "0")
+        self.assertEqual(rc, 1)
+        self.assertIn("--stop must be between 0 and 100", out)
+
+
+class SwingSignal(unittest.TestCase):
+    def test_uses_the_trend_rule(self):
+        tr = bot.trend_module()
+        orig = tr.load_chart
+        closes = [100 + i * 0.5 for i in range(260)]  # steady climb: above a rising average
+        tr.load_chart = lambda s, offline=None, rng="2y": [("d%d" % i, c) for i, c in enumerate(closes)]
+        try:
+            s = bot.swing_signal("ANY")
+        finally:
+            tr.load_chart = orig
+        self.assertTrue(s["above_ma"] and s["ma_rising"])
+        self.assertIn(s["verdict"], ("SETUP", "WATCH"))
+
+
 class PtrPath(unittest.TestCase):
     def setUp(self):
         self._env = dict(os.environ)
