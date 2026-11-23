@@ -32,8 +32,8 @@ cp agents/*.md ~/.claude/agents/
 Then: `/trader-agents setup`, and `/trader-agents run` each day.
 
 ```bash
-python3 -m unittest discover -s tests
+python -m unittest discover -s tests
 ```
 
-Standard-library Python 3.9+. Data: Yahoo Finance daily bars (free, unofficial,
+Standard-library Python 3.9+ (`python3` instead of `python` on macOS/Linux). Data: Yahoo Finance daily bars (free, unofficial,
 can lag). Not financial advice; paper only - nothing here places an order.

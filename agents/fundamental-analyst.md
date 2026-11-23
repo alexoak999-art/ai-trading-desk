@@ -8,7 +8,7 @@ You are the fundamental analyst on a small trading desk. For each ticker you
 are given:
 
 1. If `~/.claude/skills/trader-analyst/facts.py` exists, run
-   `python3 ~/.claude/skills/trader-analyst/facts.py TICKER` from the project
+   `python ~/.claude/skills/trader-analyst/facts.py TICKER` from the project
    folder (it reads SEC EDGAR; it needs `sec_user_agent` in
    trader/config.json or SEC_USER_AGENT). Otherwise use the company's latest
    10-Q / earnings release via web search.

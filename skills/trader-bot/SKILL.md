@@ -23,17 +23,19 @@ nothing touches real money.
 
 `${CLAUDE_SKILL_DIR}` is this skill's folder. Run everything from the user's
 trading project folder; state and a log of every order go to `trader/bot/`.
+Commands use `python` (Windows); on macOS or Linux, use `python3` if `python`
+is not found. The cron lines below are for macOS/Linux; on Windows use Task Scheduler.
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/bot.py" check
-python3 "${CLAUDE_SKILL_DIR}/bot.py" test-buy AAPL
-python3 "${CLAUDE_SKILL_DIR}/bot.py" trail start TSLA --qty 10 --stop 10 --trigger 10 --trail 5 --ladder 5:5,8:10
-python3 "${CLAUDE_SKILL_DIR}/bot.py" trail run
-python3 "${CLAUDE_SKILL_DIR}/bot.py" copy run --member mccaul --dollars 1000
-python3 "${CLAUDE_SKILL_DIR}/bot.py" wheel start TSLA --put-otm 10 --call-over 10 --dte 14-28 --take-profit 50
-python3 "${CLAUDE_SKILL_DIR}/bot.py" wheel run
-python3 "${CLAUDE_SKILL_DIR}/bot.py" status
-python3 "${CLAUDE_SKILL_DIR}/bot.py" --dry-run trail start TSLA --qty 10    # print orders, send nothing
+python "${CLAUDE_SKILL_DIR}/bot.py" check
+python "${CLAUDE_SKILL_DIR}/bot.py" test-buy AAPL
+python "${CLAUDE_SKILL_DIR}/bot.py" trail start TSLA --qty 10 --stop 10 --trigger 10 --trail 5 --ladder 5:5,8:10
+python "${CLAUDE_SKILL_DIR}/bot.py" trail run
+python "${CLAUDE_SKILL_DIR}/bot.py" copy run --member mccaul --dollars 1000
+python "${CLAUDE_SKILL_DIR}/bot.py" wheel start TSLA --put-otm 10 --call-over 10 --dte 14-28 --take-profit 50
+python "${CLAUDE_SKILL_DIR}/bot.py" wheel run
+python "${CLAUDE_SKILL_DIR}/bot.py" status
+python "${CLAUDE_SKILL_DIR}/bot.py" --dry-run trail start TSLA --qty 10    # print orders, send nothing
 ```
 
 ## Step 1: the Alpaca paper account (the user does this)

@@ -24,16 +24,17 @@ while, and develop a process. You decide; the agents do the legwork.
 `${CLAUDE_SKILL_DIR}` is this skill's folder. Everything is written under
 `trader/` in the current project. Agent 1 and 2 reuse the Day Trader pack's
 tools (`trader-analyst`, `trader-news`); if they are not installed, the agents
-fall back to web search.
+fall back to web search. Commands use `python` (Windows); on macOS or Linux, use
+`python3` if `python` is not found.
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/trend.py"                         # agent 3 on the names in trader/agents.json
-python3 "${CLAUDE_SKILL_DIR}/trend.py" AAPL MSFT --history     # + every past time the rule fired (10 years)
-python3 "${CLAUDE_SKILL_DIR}/trend.py" --write                 # -> trader/agents/technical.json
-python3 "${CLAUDE_SKILL_DIR}/paper.py" show                    # paper account, marked to the latest price
-python3 "${CLAUDE_SKILL_DIR}/paper.py" buy MSFT --qty 5 --reason "..."
-python3 "${CLAUDE_SKILL_DIR}/paper.py" sell MSFT
-python3 "${CLAUDE_SKILL_DIR}/paper.py" journal
+python "${CLAUDE_SKILL_DIR}/trend.py"                         # agent 3 on the names in trader/agents.json
+python "${CLAUDE_SKILL_DIR}/trend.py" AAPL MSFT --history     # + every past time the rule fired (10 years)
+python "${CLAUDE_SKILL_DIR}/trend.py" --write                 # -> trader/agents/technical.json
+python "${CLAUDE_SKILL_DIR}/paper.py" show                    # paper account, marked to the latest price
+python "${CLAUDE_SKILL_DIR}/paper.py" buy MSFT --qty 5 --reason "..."
+python "${CLAUDE_SKILL_DIR}/paper.py" sell MSFT
+python "${CLAUDE_SKILL_DIR}/paper.py" journal
 ```
 
 ## Setup (once)
@@ -59,10 +60,10 @@ python3 "${CLAUDE_SKILL_DIR}/paper.py" journal
    names and today's date. Each writes `trader/agents/<role>.md` and returns
    a short per-name summary. Without subagents, do the two jobs one after the
    other yourself.
-   - Agent 1: `python3 <trader-analyst>/facts.py TICKER` for the quarters,
+   - Agent 1: `python <trader-analyst>/facts.py TICKER` for the quarters,
      margins and EPS; the latest earnings date and the next one; analyst
      estimate changes from web search, with the source.
-   - Agent 2: `python3 <trader-news>/news.py --tickers ... --hours 72` for
+   - Agent 2: `python <trader-news>/news.py --tickers ... --hours 72` for
      headlines and 8-Ks; web search for the bull and bear case, sentiment on
      X / Reddit / StockTwits (say it is a read of public posts, not a
      measurement), and catalysts in the next 3 months (earnings, product

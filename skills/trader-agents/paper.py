@@ -5,11 +5,11 @@ Every trade is written to trader/paper.json with the date, the price, your
 reason and the agents' verdicts at that moment, so later you can see whether
 the process works -- the point of paper trading, per the reel.
 
-  python3 paper.py buy AAPL --qty 10 --reason "SETUP: ROC reset, earnings beat"
-  python3 paper.py buy AAPL --qty 10 --price 271.50
-  python3 paper.py sell AAPL                     # the whole position
-  python3 paper.py show                          # marked to the last close
-  python3 paper.py journal
+  python paper.py buy AAPL --qty 10 --reason "SETUP: ROC reset, earnings beat"
+  python paper.py buy AAPL --qty 10 --price 271.50
+  python paper.py sell AAPL                     # the whole position
+  python paper.py show                          # marked to the last close
+  python paper.py journal
 
 Prices default to Yahoo's latest regular-market price (free, can lag).
 """

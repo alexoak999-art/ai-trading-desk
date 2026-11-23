@@ -2,14 +2,14 @@
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, and the options wheel. PAPER ACCOUNT ONLY.
 
-  python3 bot.py check                                   # keys work? paper? market open?
-  python3 bot.py test-buy AAPL                           # the connection test: buy 1 share
-  python3 bot.py trail start TSLA --qty 10 --stop 10 --trigger 10 --trail 5 --ladder 5:5,8:10
-  python3 bot.py trail run                               # every 5 min in market hours
-  python3 bot.py copy run --member mccaul --dollars 1000 # each morning / hourly
-  python3 bot.py wheel start TSLA --put-otm 10 --call-over 10 --dte 14-28 --take-profit 50
-  python3 bot.py wheel run                               # every 15 min in market hours
-  python3 bot.py status                                  # account + every strategy
+  python bot.py check                                   # keys work? paper? market open?
+  python bot.py test-buy AAPL                           # the connection test: buy 1 share
+  python bot.py trail start TSLA --qty 10 --stop 10 --trigger 10 --trail 5 --ladder 5:5,8:10
+  python bot.py trail run                               # every 5 min in market hours
+  python bot.py copy run --member mccaul --dollars 1000 # each morning / hourly
+  python bot.py wheel start TSLA --put-otm 10 --call-over 10 --dte 14-28 --take-profit 50
+  python bot.py wheel run                               # every 15 min in market hours
+  python bot.py status                                  # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
 State and a log of every order live in trader/bot/. Each `run` does nothing

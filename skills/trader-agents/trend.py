@@ -20,8 +20,8 @@ a reality check, not a promise).
 Standard library only. Data: Yahoo Finance v8 chart, daily bars (free,
 unofficial, can lag). --offline DIR reads DIR/SYMBOL.json instead.
 
-  python3 trend.py AAPL MSFT NVDA GOOGL AMZN
-  python3 trend.py --config trader/agents.json --history --write
+  python trend.py AAPL MSFT NVDA GOOGL AMZN
+  python trend.py --config trader/agents.json --history --write
 """
 import argparse
 import datetime
