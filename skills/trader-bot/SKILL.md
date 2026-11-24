@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs ten rule-based strategies on a schedule: a
+  a one-share buy, then runs eleven rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -23,7 +23,9 @@ description: >-
   target monthly or quarterly when a name drifts past a band), and a
   gap-and-go day trade (a stock that opens 3%+ above yesterday's close and
   breaks its first 5 minutes' high, stop just under the open, 2R target,
-  flat by 3:55 PM). Paper account only. Use when the user says "trading bot",
+  flat by 3:55 PM), and momentum rotation (rank a list of names by their
+  ~6-month return each month, hold the top few, sell what drops out, cash
+  when nothing is up). Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
@@ -31,8 +33,8 @@ description: >-
   dip on RSI", "dollar-cost averaging", "DCA", "buy every week", "covered calls
   only", "sell calls on my shares", "rebalance",
   "target weights", "60/40", "gap and go",
-  "trade the gappers", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | status]"
+  "trade the gappers", "momentum rotation", "sector rotation", "hold the leaders", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | rotate | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -295,6 +297,26 @@ does the work. Long only. The user picks the names; do not pick for them.
    name, never a name another strategy holds; everything sold by
    `--flat-by` (15:55). Its trades are kept apart from the breakout's.
 
+## Step 5i: strategy 11, momentum rotation
+
+`rotate start SYMBOL ...` stores the plan; `rotate run` once a day trades only
+on its dates (day `--day` of each month by default, or `--every weekly`). The
+user picks the names (often sector or asset-class ETFs); do not pick for them.
+
+1. **Rank**: every name by its return over the last `--lookback` sessions
+   (126, about 6 months), from Yahoo's dividend-adjusted daily closes;
+   `--skip 21` leaves out the latest month, as many momentum studies do.
+2. **Pick**: the top `--top` (2) whose return is above `--min-mom`% (0). A
+   slot with no name above that sits in cash: the "absolute momentum" filter
+   that keeps it out of a falling market. A name another strategy trades is
+   skipped and the next one takes its place.
+3. **Trade**: the first run splits `--dollars` (10,000) evenly. On each date,
+   names that dropped out are sold in full and the new leaders bought with
+   the sleeve's value / `--top` each. Names that stay are not touched. Market
+   orders, fractional where Alpaca allows. No stop orders: the exit is the
+   next rotation, so a holding can fall a lot within a month.
+4. `rotate stop` ends the trading; what it holds stays in the account.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -313,6 +335,7 @@ as a Mac mini), with the user's own folder:
 0 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py dca run >> trader/bot/cron.log 2>&1
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py cc run >> trader/bot/cron.log 2>&1
 5 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rebal run >> trader/bot/cron.log 2>&1
+10 10 * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rotate run >> trader/bot/cron.log 2>&1
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py gap run >> trader/bot/cron.log 2>&1
 ```
 

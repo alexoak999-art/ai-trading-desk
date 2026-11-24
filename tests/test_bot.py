@@ -983,6 +983,127 @@ class Rebal(InTmp):
         self.assertIn("No rebalance plan running", out)
 
 
+def closes_with(mom, n=200, lookback=126):
+    """Flat closes at 100 with the last one set so the lookback return is `mom` percent."""
+    c = [100.0] * n
+    c[-1] = 100.0 * (1 + mom / 100)
+    return c
+
+
+class Momentum(unittest.TestCase):
+    def test_return_over_lookback_and_skip(self):
+        c = [float(x) for x in range(1, 301)]  # 1 .. 300
+        self.assertAlmostEqual(bot.momentum(c, 100, 0), (300 / 200 - 1) * 100)
+        self.assertAlmostEqual(bot.momentum(c, 100, 21), (279 / 179 - 1) * 100)
+        self.assertIsNone(bot.momentum(c[:100], 100, 0))
+
+
+class Rotate(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeDca(cash=50000)
+        self.api.prices.update(XLK=200.0, XLE=100.0, XLF=50.0, XLV=150.0)
+        self.mom = {"XLK": 20.0, "XLE": 10.0, "XLF": 5.0, "XLV": -3.0}
+        self._orig = bot.rot_closes
+        bot.rot_closes = lambda s: closes_with(self.mom[s])
+
+    def tearDown(self):
+        bot.rot_closes = self._orig
+        super().tearDown()
+
+    def start_and_run(self, *extra):
+        rc, out = run(self.api, "rotate", "start", "XLK", "XLE", "XLF", "XLV", *extra)
+        self.assertEqual(rc, 0, out)
+        return run(self.api, "rotate", "run")
+
+    def due(self):
+        st = bot.load(bot.ROT)
+        st["next"] = TODAY.isoformat()
+        bot.save(bot.ROT, st)
+
+    def test_first_run_buys_the_top_two_evenly(self):
+        rc, out = self.start_and_run()
+        self.assertIn("XLK +20.0%, XLE +10.0%, XLF +5.0%, XLV -3.0%", out)
+        self.assertIn("XLK: BUY 25 shares (~$5000.00) at about 200.00", out)
+        self.assertIn("XLE: BUY 50 shares (~$5000.00) at about 100.00", out)
+        st = bot.load(bot.ROT)
+        self.assertEqual(st["shares"], {"XLK": 25.0, "XLE": 50.0})
+        self.assertAlmostEqual(st["cash"], 0.0)
+        self.assertEqual(st["next"], bot.dca_next(st, TODAY, False).isoformat())
+
+    def test_not_due_does_nothing(self):
+        self.start_and_run()
+        n = len(self.api.sent)
+        rc, out = run(self.api, "rotate", "run")
+        self.assertIn("Rotation: holds XLE, XLK; sleeve cash $0.00; next rotation", out)
+        self.assertEqual(len(self.api.sent), n)
+
+    def test_rotates_out_of_the_laggard_into_the_new_leader(self):
+        self.start_and_run()
+        self.mom.update(XLE=-1.0, XLF=30.0)
+        self.api.prices["XLE"] = 120.0  # 50 shares now worth 6000
+        self.due()
+        rc, out = run(self.api, "rotate", "run")
+        self.assertIn("XLE dropped out of the top 2:", out)
+        self.assertIn("XLE: SELL 50 shares (~$6000.00)", out)
+        sell = [o for o in self.api.sent if o["side"] == "sell"][0]
+        self.assertEqual((sell["symbol"], sell["qty"]), ("XLE", 50.0))
+        buy = self.api.sent[-1]
+        self.assertEqual((buy["symbol"], buy["side"]), ("XLF", "buy"))
+        self.assertAlmostEqual(buy["notional"], 5500.0)  # (5000 XLK + 6000 cash) / 2
+        st = bot.load(bot.ROT)
+        self.assertEqual(sorted(st["shares"]), ["XLF", "XLK"])
+        self.assertAlmostEqual(st["cash"], 500.0)
+        self.assertEqual(st["history"][-1]["picks"], ["XLF", "XLK"])
+
+    def test_negative_momentum_leaves_the_slot_in_cash(self):
+        self.mom.update(XLE=-1.0, XLF=-2.0)
+        rc, out = self.start_and_run()
+        self.assertIn("Only 1 name(s) usable above +0%: 1 slot(s) stay in cash", out)
+        self.assertEqual([o["symbol"] for o in self.api.sent], ["XLK"])
+        self.assertAlmostEqual(bot.load(bot.ROT)["cash"], 5000.0)
+
+    def test_skips_names_another_strategy_trades(self):
+        bot.save(bot.DCA, {"status": "on", "weights": {"XLK": 1.0}, "buys": [], "carry": {}})
+        rc, out = run(self.api, "rotate", "start", "XLK", "XLE", "XLF", "XLV")
+        self.assertIn("Traded by other strategies now, so skipped while they are: XLK (dca)", out)
+        rc, out = run(self.api, "rotate", "run")
+        self.assertIn("XLK: ranks in, but the dca strategy trades it; the next name takes its place", out)
+        self.assertEqual(sorted(o["symbol"] for o in self.api.sent), ["XLE", "XLF"])
+
+    def test_other_strategies_keep_out_of_its_holdings(self):
+        self.start_and_run()
+        self.assertEqual(bot.strategy_symbols().get("XLK"), "rotate")
+        self.assertIn("XLE", bot.other_bot_symbols())
+
+    def test_whole_shares_when_not_fractionable(self):
+        self.api.whole_only.add("XLK")
+        self.api.prices["XLK"] = 300.0
+        rc, out = self.start_and_run()
+        self.assertEqual(self.api.sent[0]["qty"], 16)  # 5000 // 300
+        self.assertAlmostEqual(bot.load(bot.ROT)["cash"], 200.0)
+
+    def test_needs_more_names_than_top(self):
+        rc, out = run(self.api, "rotate", "start", "XLK", "XLE", "--top", "2")
+        self.assertEqual(rc, 1)
+        self.assertIn("give more names than --top (2)", out)
+
+    def test_dry_run_status_and_stop(self):
+        rc, out = run(self.api, "--dry-run", "rotate", "start", "XLK", "XLE", "XLF")
+        self.assertIn("XLK: WOULD BUY 25 shares", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.ROT))
+        self.start_and_run()
+        self.api.prices["XLK"] = 220.0
+        rc, out = run(self.api, "status")
+        self.assertIn("rotate: on, top 2 of XLK, XLE, XLF, XLV; holds XLE $5000.00, XLK $5500.00; "
+                      "sleeve cash $0.00; worth $10500.00 (+5.0% on $10000)", out)
+        rc, out = run(self.api, "rotate", "stop")
+        self.assertIn("What it holds (XLE, XLK) stays in the account", out)
+        rc, out = run(self.api, "rotate", "run")
+        self.assertIn("No momentum rotation running", out)
+
+
 ET = datetime.timezone(datetime.timedelta(hours=-5))
 
 

@@ -2,7 +2,8 @@
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
 day trade, an oversold bounce, dollar-cost averaging, covered calls,
-rebalancing to target weights, and a gap-and-go day trade. PAPER ACCOUNT ONLY.
+rebalancing to target weights, a gap-and-go day trade, and momentum rotation.
+PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -32,6 +33,9 @@ rebalancing to target weights, and a gap-and-go day trade. PAPER ACCOUNT ONLY.
   python bot.py gap start AMZN TSLA --min-gap 3 [--max-gap 10] --stop open --target-r 2
   python bot.py gap run                                 # every 5 min in market hours
   python bot.py gap stop                                # no new trades; open ones still flat by close
+  python bot.py rotate start XLK XLF XLE XLV --top 2 --lookback 126 --dollars 10000 --every monthly --day 1
+  python bot.py rotate run                              # once a day; trades only on its dates
+  python bot.py rotate stop                             # no more trades; holdings stay
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -579,6 +583,8 @@ def strategy_symbols():
             out.update({s: "dca" for s in st.get("weights", {})})
         elif f == "rebal.json" and (st.get("status") == "on" or any(st.get("shares", {}).values())):
             out.update({s: "rebal" for s in st.get("weights", {})})
+        elif f == "rotate.json":
+            out.update({s: "rotate" for s, q in st.get("shares", {}).items() if q > 0})
     return out
 
 
@@ -721,6 +727,8 @@ def other_bot_symbols():
             st = load(os.path.join(DIR, f)) or {}
             if st.get("status") in ("open", "on"):
                 out.add(st.get("symbol"))
+    rot = load(ROT) if os.path.isdir(DIR) else None
+    out.update(s for s, q in ((rot or {}).get("shares") or {}).items() if q > 0)
     return out
 
 
@@ -1449,6 +1457,232 @@ def rebal_stop(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 11: momentum rotation
+
+ROT = os.path.join(DIR, "rotate.json")
+
+
+def rot_closes(sym):
+    """Daily closes (dividend-adjusted), oldest first, from Yahoo; the last one is today's price until the close."""
+    return [c for _, c in trend_module().load_chart(sym, None, "2y")]
+
+
+def momentum(closes, lookback, skip):
+    """Return over `lookback` sessions, ending `skip` sessions ago, in percent; None without enough history."""
+    if len(closes) < lookback + skip + 1:
+        return None
+    return (closes[-1 - skip] / closes[-1 - skip - lookback] - 1) * 100
+
+
+def rot_value(api, st):
+    """(holdings value, {sym: (shares, price, value)}) of what the rotation holds."""
+    rows = {}
+    for sym, q in st["shares"].items():
+        if q > 0:
+            p = api.last_price(sym)
+            rows[sym] = (q, p, q * p)
+    return sum(r[2] for r in rows.values()), rows
+
+
+def rot_book(st, sym, side, qty, px):
+    q = st["shares"].get(sym, 0.0) + (qty if side == "buy" else -qty)
+    st["shares"][sym] = round(q, 6) if q > 1e-6 else 0.0
+    st["cash"] = round(st["cash"] + (-qty * px if side == "buy" else qty * px), 2)
+    if not st["shares"][sym]:
+        del st["shares"][sym]
+
+
+def rot_trade(api, st, sym, side, price, dry, out, dollars=None, qty=None):
+    """A market order: buy about `dollars` (fractional where Alpaca allows, else whole shares), or sell `qty` shares."""
+    if side == "buy":
+        if (api.asset(sym) or {}).get("fractionable"):
+            order, qty = dict(notional=round(dollars, 2)), dollars / price
+        else:
+            qty = int(dollars // price)
+            if qty < 1:
+                out.append("%s: $%.2f buys no whole share at %.2f (not fractionable); skipped." % (sym, dollars, price))
+                return
+            order = dict(qty=qty)
+    else:
+        order = dict(qty=qty)
+    o = wait_fill(api, api.submit_order(symbol=sym, side=side, type="market", time_in_force="day", **order))
+    px = float(o.get("filled_avg_price") or price)
+    if o.get("status") in ("filled", "dry_run"):
+        rot_book(st, sym, side, float(o.get("filled_qty") or qty), px)
+    else:
+        st["pending"].append({"order_id": o.get("id"), "symbol": sym, "side": side})
+    log("rotate_" + side, symbol=sym, qty=round(qty, 6), price=money(px), dry_run=dry)
+    out.append("%s: %s %s shares (~$%.2f) at about %.2f." % (
+        sym, ("WOULD " + side.upper()) if dry else side.upper(), ("%.4f" % qty).rstrip("0").rstrip("."), qty * px, px))
+
+
+def rot_rank(st, out):
+    """[(momentum %, sym)] best first, for the names with enough history."""
+    ranked = []
+    for sym in st["symbols"]:
+        try:
+            m = momentum(rot_closes(sym), st["lookback"], st["skip"])
+        except Exception as e:
+            out.append("%s: no daily closes from Yahoo (%s); left out this time." % (sym, e))
+            continue
+        if m is None:
+            out.append("%s: not enough history for a %d-session lookback; left out." % (sym, st["lookback"]))
+            continue
+        ranked.append((m, sym))
+    return sorted(ranked, reverse=True)
+
+
+def rot_step(api, st, today, dry):
+    out = []
+    # 1. settle orders that had not filled
+    for p in list(st["pending"]):
+        o = api.order(p["order_id"]) or {}
+        if o.get("status") == "filled":
+            rot_book(st, p["symbol"], p["side"], float(o.get("filled_qty") or 0),
+                     float(o.get("filled_avg_price") or 0))
+            st["pending"].remove(p)
+        elif o.get("status") not in LIVE:
+            st["pending"].remove(p)
+            out.append("%s: a %s order ended %s." % (p["symbol"], p["side"], o.get("status", "unknown")))
+    if st["pending"]:
+        out.append("Waiting for %d order(s) to fill before trading again." % len(st["pending"]))
+        return out
+    if st.get("status") != "on":
+        return out
+    held, rows = rot_value(api, st)
+    if today < datetime.date.fromisoformat(st["next"]):
+        out.append("Rotation: holds %s; sleeve cash $%.2f; next rotation %s." % (
+            ", ".join(sorted(rows)) or "nothing", st["cash"], st["next"]))
+        return out
+
+    # 2. rank, and pick the top names above the momentum floor that no other strategy trades
+    ranked = rot_rank(st, out)
+    out.append("Rotation, %d-session return%s: %s." % (
+        st["lookback"], " skipping the last %d" % st["skip"] if st["skip"] else "",
+        ", ".join("%s %+.1f%%" % (s, m) for m, s in ranked) or "no names ranked"))
+    if not ranked:
+        out.append("Nothing ranked, so nothing traded. Next try on the next run.")
+        return out
+    busy = {s: o for s, o in strategy_symbols().items() if o != "rotate"}
+    picks = []
+    for m, sym in ranked:
+        if len(picks) == st["top"] or m <= st["min_mom"]:
+            break
+        if sym in busy and sym not in rows:
+            out.append("%s: ranks in, but the %s strategy trades it; the next name takes its place." % (sym, busy[sym]))
+            continue
+        picks.append(sym)
+    if len(picks) < st["top"]:
+        out.append("Only %d name(s) usable above %+g%%: %d slot(s) stay in cash." % (
+            len(picks), st["min_mom"], st["top"] - len(picks)))
+
+    # 3. sell what dropped out, then buy what came in
+    for sym, (q, px, v) in sorted(rows.items()):
+        if sym in picks:
+            continue
+        pos = api.position(sym)
+        have = min(q, float(pos["qty"])) if pos else 0.0
+        if have <= 0:
+            out.append("%s: the rotation's shares are gone from the account (sold by hand?); written off." % sym)
+            st["shares"].pop(sym, None)
+            continue
+        out.append("%s dropped out of the top %d:" % (sym, st["top"]))
+        rot_trade(api, st, sym, "sell", px, dry, out, qty=have)
+    held, rows = rot_value(api, st)
+    slot = (held + st["cash"]) / st["top"]
+    cash = float(api.account().get("cash") or 0)
+    for sym in picks:
+        if sym in rows:
+            continue
+        amt = min(slot, st["cash"], cash)
+        if amt < st["min_trade"]:
+            out.append("%s: only $%.2f to spend (sleeve cash $%.2f, account cash $%.0f); skipped." % (
+                sym, amt, st["cash"], cash))
+            continue
+        rot_trade(api, st, sym, "buy", api.last_price(sym), dry, out, dollars=amt)
+        cash -= amt
+    st["history"].append({"date": today.isoformat(), "ranked": [[s, round(m, 2)] for m, s in ranked],
+                          "picks": picks})
+    st["next"] = dca_next(st, today, False).isoformat()
+    out.append("Holding %s. Next rotation %s." % (", ".join(picks) or "cash", st["next"]))
+    return out
+
+
+def rot_start(api, a):
+    syms = list(dict.fromkeys(s.upper() for s in a.symbols))
+    errs = []
+    if a.top < 1 or len(syms) <= a.top:
+        errs.append("give more names than --top (%d), so there is something to rotate between" % a.top)
+    if a.lookback < 20 or a.skip < 0 or a.lookback + a.skip > 400:
+        errs.append("--lookback must be 20 or more sessions, --skip 0 or more, and the two under 400")
+    if a.dollars < 100 or a.min_trade < 1:
+        errs.append("--dollars must be at least 100 and --min-trade at least 1")
+    if a.every == "monthly":
+        if not (a.day.isdigit() and 1 <= int(a.day) <= 28):
+            errs.append("--day for monthly is a day of the month, 1-28")
+    elif a.day not in WEEKDAYS:
+        errs.append("--day for weekly is one of %s" % ", ".join(WEEKDAYS))
+    for e in errs:
+        say("rotate: " + e)
+    if errs:
+        return 1
+    trend_module()  # daily closes come from Yahoo through trader-agents' trend.py
+    st = load(ROT) or {"shares": {}, "pending": [], "history": []}
+    if not st["shares"] and not st["history"]:
+        st.update(cash=a.dollars, dollars=a.dollars)
+    elif a.dollars != st["dollars"]:
+        say("rotate: already running with $%g; --dollars only applies to a new plan." % st["dollars"])
+    st.update(symbols=syms, top=a.top, lookback=a.lookback, skip=a.skip, min_mom=a.min_mom,
+              every=a.every, day=a.day, min_trade=a.min_trade, status="on")
+    st["next"] = datetime.date.today().isoformat() if not st["history"] else dca_next(
+        st, datetime.date.today(), True).isoformat()
+    busy = {s: o for s, o in strategy_symbols().items() if o != "rotate" and s in syms}
+    if not a.dry_run:
+        save(ROT, st)
+    say("Momentum rotation over %s: %s, rank them by their %d-session return%s and hold the top %d with "
+        "$%g split evenly, at market, fractional where Alpaca allows. A name needs a return above %+g%% to be "
+        "held; otherwise its slot sits in cash. Names that drop out are sold, new leaders bought. No stop "
+        "orders: the exit is the next rotation. `rotate run` does the work.%s" % (
+            ", ".join(syms), "every %s" % a.day.capitalize() if a.every == "weekly"
+            else "on day %s of each month" % a.day, a.lookback,
+            " (skipping the last %d)" % a.skip if a.skip else "", a.top, st["dollars"], a.min_mom,
+            " Traded by other strategies now, so skipped while they are: %s." % ", ".join(
+                "%s (%s)" % kv for kv in sorted(busy.items())) if busy else ""))
+    if a.dry_run:
+        say("Preview of the first `rotate run` (nothing is saved or sent):")
+        st["next"] = datetime.date.today().isoformat()
+        for m in rot_step(api, st, datetime.date.today(), True):
+            say(m)
+    return 0
+
+
+def rot_run(api, a):
+    st = load(ROT)
+    if not st or (st.get("status") != "on" and not st.get("pending")):
+        say("No momentum rotation%s." % (" running" if st else ". Start one with `rotate start SYMBOL ...`"))
+        return 0
+    if not market_open(api):
+        return 0
+    for m in rot_step(api, st, datetime.date.today(), a.dry_run):
+        say(m)
+    if not a.dry_run:
+        save(ROT, st)
+    return 0
+
+
+def rot_stop(api, a):
+    st = load(ROT)
+    if not st:
+        say("No momentum rotation.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(ROT, st)
+    say("Momentum rotation stopped: no more trades. What it holds (%s) stays in the account." % (
+        ", ".join(sorted(st["shares"])) or "nothing"))
+    return 0
+
+
 # ---------------------------------------------------------------- strategy 5: opening-range breakout
 
 ORB = os.path.join(DIR, "orb.json")
@@ -1858,6 +2092,14 @@ def status(api, a):
                                             for s, r in rows.items()),
                 total, " (%+.1f%% on $%g)" % ((total / st["dollars"] - 1) * 100, st["dollars"])
                 if st.get("funded") else ", not funded yet", st.get("next")))
+        elif f == "rotate.json":
+            held, rows = rot_value(api, st)
+            total = held + st["cash"]
+            say("rotate: %s, top %d of %s; holds %s; sleeve cash $%.2f; worth $%.2f (%+.1f%% on $%g); next %s" % (
+                st.get("status"), st["top"], ", ".join(st["symbols"]),
+                ", ".join("%s $%.2f" % (s, r[2]) for s, r in sorted(rows.items())) or "nothing",
+                st["cash"], total, (total / st["dollars"] - 1) * 100, st["dollars"],
+                st.get("next") if st.get("status") == "on" else "none"))
         elif f == "dca.json":
             cost, value, held = dca_value(api, st)
             say("dca: %s, $%g %s into %s; next buy %s; invested $%.2f, worth $%.2f%s" % (
@@ -1983,6 +2225,21 @@ def parser():
     r.add_parser("run")
     r.add_parser("stop")
 
+    m = sub.add_parser("rotate").add_subparsers(dest="sub", required=True)
+    p = m.add_parser("start")
+    p.add_argument("symbols", nargs="+", help="the names to rotate between, e.g. XLK XLF XLE XLV")
+    p.add_argument("--top", type=int, default=2, help="how many of the leaders to hold (default 2)")
+    p.add_argument("--lookback", type=int, default=126, help="sessions of return to rank by (default 126, ~6 months)")
+    p.add_argument("--skip", type=int, default=0, help="leave out the last N sessions (default 0; 21 skips a month)")
+    p.add_argument("--min-mom", type=float, default=0,
+                   help="hold a name only if its return is above this %% (default 0; else that slot sits in cash)")
+    p.add_argument("--dollars", type=float, default=10000, help="dollars for the rotation (default 10000)")
+    p.add_argument("--every", choices=("weekly", "monthly"), default="monthly")
+    p.add_argument("--day", default="1", help="1-28 for monthly, mon..fri for weekly (default 1)")
+    p.add_argument("--min-trade", type=float, default=25, help="skip buys smaller than this many dollars (default 25)")
+    m.add_parser("run")
+    m.add_parser("stop")
+
     g = sub.add_parser("gap").add_subparsers(dest="sub", required=True)
     p = g.add_parser("start")
     p.add_argument("symbols", nargs="+")
@@ -2033,7 +2290,8 @@ def main(argv=None, api=None):
           ("dca", "start"): dca_start, ("dca", "run"): dca_run, ("dca", "stop"): dca_stop,
           ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop,
           ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop,
-          ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop,
+          ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
