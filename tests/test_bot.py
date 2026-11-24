@@ -1676,6 +1676,71 @@ class Fcr(InTmp):
         self.assertIn("no new trades", out)
 
 
+class Alerts(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.toasts, self.pushes = [], []
+        self._orig = bot.send_toast, bot.send_ntfy
+        bot.send_toast = lambda t, b: self.toasts.append((t, b))
+        bot.send_ntfy = lambda srv, topic, t, b: self.pushes.append((srv, topic, t, b))
+        self.api = FakeOrb()
+        self.api.prices.update(AAPL=102.3)
+
+    def tearDown(self):
+        bot.send_toast, bot.send_ntfy = self._orig
+        super().tearDown()
+
+    def test_off_until_set_up(self):
+        bot.log("dca_buy", symbol="SPY", qty=0.1, price=600.0, dry_run=False)
+        self.assertEqual((self.toasts, self.pushes), ([], []))
+
+    def test_every_order_alerts_and_dry_runs_and_stop_raises_do_not(self):
+        rc, out = run(self.api, "notify", "setup", "--phone")
+        topic = bot.load(bot.NOTIFY)["ntfy_topic"]
+        self.assertTrue(topic.startswith("tradebot-"))
+        self.assertIn("subscribe to the topic %s" % topic, out)
+        bot.log("orb_entry", symbol="AMZN", qty=7, entry=253.9, stop=251.97, target=258.06, dry_run=False)
+        bot.log("orb_entry", symbol="AMZN", qty=7, entry=253.9, dry_run=True)
+        bot.log("trail_raise", symbol="TSLA", floor=400.0)
+        bot.log("fcr_exit", symbol="QQQ", side="short", qty=3, entry=635.23, exit=631.11, how="TARGET HIT",
+                r=2.57, pnl=12.36, dry_run=False)
+        self.assertEqual(self.toasts, [
+            ("Trade bot: ORB ENTRY", "AMZN | qty 7 | entry 253.90 | stop 251.97 | target 258.06"),
+            ("Trade bot: FCR EXIT", "QQQ | side short | qty 3 | entry 635.23 | exit 631.11 | how TARGET HIT | "
+                                    "r 2.57 | pnl 12.36")])
+        self.assertEqual([(p[0], p[1], p[2]) for p in self.pushes],
+                         [("https://ntfy.sh", topic, "Trade bot: ORB ENTRY"), ("https://ntfy.sh", topic, "Trade bot: FCR EXIT")])
+
+    def test_a_real_trade_from_a_strategy_alerts(self):
+        run(self.api, "notify", "setup")
+        run(self.api, "orb", "start", "AAPL")
+        self.api.set_bars("AAPL", RANGE + [(101.2, 102.5, 101.1, 102.4)])
+        run(self.api, "orb", "run")
+        self.assertEqual(len(self.toasts), 1)
+        self.assertTrue(self.toasts[0][1].startswith("AAPL | qty 19 | entry 102.30"))
+        self.assertEqual(self.pushes, [])
+
+    def test_a_failed_push_never_stops_the_bot(self):
+        run(self.api, "notify", "setup", "--phone")
+
+        def boom(*a):
+            raise OSError("offline")
+        bot.send_ntfy = boom
+        bot.log("dca_buy", symbol="SPY", qty=0.1, price=600.0, dry_run=False)
+        self.assertEqual(len(self.toasts), 1)
+
+    def test_test_and_off(self):
+        rc, out = run(self.api, "notify", "test")
+        self.assertEqual(rc, 1)
+        run(self.api, "notify", "setup", "--phone")
+        rc, out = run(self.api, "notify", "test")
+        self.assertIn("Test alert sent (pop-up and phone)", out)
+        self.assertEqual(self.toasts[-1][0], "Trade bot: TEST")
+        run(self.api, "notify", "off")
+        bot.log("dca_buy", symbol="SPY", qty=0.1, dry_run=False)
+        self.assertEqual(len(self.toasts), 1)
+
+
 class PtrPath(unittest.TestCase):
     def setUp(self):
         self._env = dict(os.environ)
