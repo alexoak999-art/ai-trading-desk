@@ -28,7 +28,9 @@ baseline, covered calls on shares you hold, rebalancing to target
 weights, a gap-and-go day trade, and momentum rotation (hold the top names
 by 6-month return, monthly), and the First Candle Rule (a 5-minute candle's
 fair-value-gap break, long and short, 3R), and a protective collar (a put
-under 100 shares paid for by a call over them). Keys go in `trader/alpaca.env`, never in the chat; there is no live
+under 100 shares paid for by a call over them). A bankroll cap runs a small
+account inside any paper account, and `backtest` tests the day-trade rules and
+candle setups on a year of 1-minute bars. Keys go in `trader/alpaca.env`, never in the chat; there is no live
 trading address in the code. Step-by-step setup: `skills/trader-bot/SKILL.md`.
 
 ## Install (Claude Code)

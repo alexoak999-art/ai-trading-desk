@@ -44,6 +44,9 @@ protective collar (a put under 100 shares paid for by a call over them). PAPER A
   python bot.py collar run                              # every 15 min in market hours
   python bot.py collar stop AAPL                        # no new collars; the open one runs to expiration
   python bot.py notify setup [--phone]                  # a pop-up (and phone push) for every order
+  python bot.py bankroll set 500                        # this folder's bots: at most $500 + profits, long stock only
+  python bot.py backtest all --symbols AMD PYPL --days 250   # day-trade rules + candle setups on past bars
+  python bot.py bankroll show | off
   python bot.py notify test | off
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
@@ -232,6 +235,107 @@ class DryRun:
 
     def cancel_order(self, order_id):
         say("  DRY RUN, not sent: cancel %s" % order_id)
+
+
+# ---------------------------------------------------------------- bankroll: a small account inside any account
+
+BANKROLL = "trader/bankroll.json"
+
+
+def bankroll_room(api, cfg):
+    """(play money, in positions and pending buys, room left). Play money = the stake plus whatever
+    the account has made or lost since the stake was set."""
+    equity = float(api.account()["equity"])
+    play = cfg["stake"] + equity - cfg["start_equity"]
+    used = 0.0
+    for p in api.positions():
+        q = float(p["qty"])
+        if q > 0:
+            used += float(p.get("market_value") or q * api.last_price(p["symbol"]))
+    lister = getattr(api, "orders", None)
+    for o in (lister(status="open") if callable(lister) else []):
+        if o.get("side") == "buy" and occ_underlying(o["symbol"]) == o["symbol"]:
+            px = o.get("limit_price") or o.get("stop_price") or api.last_price(o["symbol"])
+            used += float(o["notional"]) if o.get("notional") else float(o.get("qty") or 0) * float(px)
+    return play, used, play - used
+
+
+class Capped:
+    """On when trader/bankroll.json exists in this folder. Every order goes through here first:
+    stock buys only while the bot's positions fit inside the stake plus profits, no options, no short sales."""
+
+    def __init__(self, inner, cfg):
+        self._inner, self._cfg = inner, cfg
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def submit_order(self, **o):
+        sym, side, stake = o.get("symbol", ""), o.get("side"), self._cfg["stake"]
+        if occ_underlying(sym) != sym:
+            raise alp.AlpacaError("bankroll: %s is an option; options are off in this $%g account." % (sym, stake))
+        pos = self._inner.position(sym)
+        held = float(pos["qty"]) if pos else 0.0
+        if side == "sell":
+            want = float(o["qty"]) if o.get("qty") else float(o["notional"]) / self._inner.last_price(sym)
+            if want > held + 1e-6:
+                raise alp.AlpacaError("bankroll: selling %g %s but only %g held; short selling is off in this "
+                                      "$%g account." % (want, sym, held, stake))
+        elif side == "buy" and held >= 0:
+            px = float(o.get("limit_price") or self._inner.last_price(sym))
+            cost = float(o["notional"]) if o.get("notional") else float(o["qty"]) * px
+            play, used, room = bankroll_room(self._inner, self._cfg)
+            if cost > room + 0.01:
+                raise alp.AlpacaError(
+                    "bankroll: buying %s for about $%.2f is more than the $%.2f left (play money $%.2f = stake "
+                    "$%g %+.2f since %s; $%.2f already in positions and pending buys). Nothing sent." % (
+                        sym, cost, max(room, 0), play, stake, play - stake, self._cfg["since"], used))
+        return self._inner.submit_order(**o)
+
+
+def backtest(api, a):
+    import backtest as bt
+    a.symbols = [x.upper() for x in a.symbols]
+    if a.days < 5 or a.slip < 0 or a.dollars <= 0 or a.max_loss <= 0:
+        say("--days must be 5 or more; --slip, --dollars and --max-loss can't be negative or zero.")
+        return 1
+    bt.run(api, a, fcr_scan, say)
+    return 0
+
+
+def bankroll_set(api, a):
+    if a.stake <= 0:
+        say("The stake must be more than $0.")
+        return 1
+    acct = api.account()
+    cfg = {"stake": a.stake, "start_equity": float(acct["equity"]), "since": datetime.date.today().isoformat()}
+    play, used, room = bankroll_room(api, cfg)
+    save(BANKROLL, cfg)
+    say("Bankroll on: the bots in this folder trade at most $%g plus what they make (account equity now $%.2f). "
+        "Stock buys only; options and short sales are refused. $%.2f is already in positions here, so $%.2f is "
+        "free to use." % (a.stake, cfg["start_equity"], used, max(room, 0)))
+    if used > a.stake:
+        say("Note: the positions already here are worth more than the stake, so no new buys until they are sold.")
+    return 0
+
+
+def bankroll_show(api, a):
+    cfg = load(BANKROLL)
+    if not cfg:
+        say("No bankroll: the bots here may use the whole account. Set one with `bankroll set 500`.")
+        return 0
+    play, used, room = bankroll_room(api, cfg)
+    say("bankroll: stake $%g since %s; play money $%.2f (%+.2f, %+.1f%%); in positions $%.2f; free $%.2f" % (
+        cfg["stake"], cfg["since"], play, play - cfg["stake"], 100 * (play - cfg["stake"]) / cfg["stake"], used,
+        max(room, 0)))
+    return 0
+
+
+def bankroll_off(api, a):
+    if os.path.exists(BANKROLL):
+        os.remove(BANKROLL)
+    say("Bankroll off: the bots here may use the whole account again.")
+    return 0
 
 
 def wait_fill(api, order, seconds=15):
@@ -2726,6 +2830,8 @@ def test_buy(api, a):
 
 def status(api, a):
     check(api, a)
+    if os.path.exists(BANKROLL):
+        bankroll_show(api, a)
     for p in api.positions():
         say("  %-22s %8s @ %-9s now %-9s P/L %s" % (p["symbol"], p["qty"], p["avg_entry_price"],
                                                     p.get("current_price"), p.get("unrealized_pl")))
@@ -2950,6 +3056,28 @@ def parser():
     g.add_parser("run")
     g.add_parser("stop")
 
+    p = sub.add_parser("backtest", help="test the day-trade rules and candle setups on past 1-minute bars")
+    p.add_argument("strategies", nargs="+", choices=("orb", "gap", "fcr", "candles", "all"))
+    p.add_argument("--symbols", nargs="+", required=True)
+    p.add_argument("--days", type=int, default=250, help="sessions to test (default 250, about a year)")
+    p.add_argument("--slip", type=float, default=0.02, help="dollars per share lost on each market fill (default 0.02)")
+    p.add_argument("--dollars", type=float, default=500, help="most dollars in one trade (default 500)")
+    p.add_argument("--max-loss", type=float, default=5, help="most dollars lost at the stop (default 5)")
+    p.add_argument("--flat-by", default="15:55")
+    p.add_argument("--range", type=int, default=15, help="ORB opening range, minutes (default 15)")
+    p.add_argument("--orb-r", type=float, default=2, help="ORB and gap target, R (default 2)")
+    p.add_argument("--min-gap", type=float, default=3, help="gap-and-go: open this %% over yesterday (default 3)")
+    p.add_argument("--fcr-r", type=float, default=3, help="First Candle target, R (default 3)")
+    p.add_argument("--sides", choices=("long", "both"), default="long", help="First Candle sides (default long)")
+    p.add_argument("--candle-r", type=float, default=2, help="candle setups target, R (default 2)")
+    p.add_argument("--candle-last", default="15:00", help="candle setups: last entry, ET (default 15:00)")
+
+    br = sub.add_parser("bankroll").add_subparsers(dest="sub", required=True)
+    p = br.add_parser("set")
+    p.add_argument("stake", type=float, help="most the bots here may have in play, plus their profits")
+    br.add_parser("show")
+    br.add_parser("off")
+
     nt = sub.add_parser("notify").add_subparsers(dest="sub", required=True)
     p = nt.add_parser("setup")
     p.add_argument("--phone", action="store_true", help="also push to your phone with the ntfy app")
@@ -2994,6 +3122,9 @@ def main(argv=None, api=None):
     except alp.AlpacaError as e:
         say("bot: %s" % e)
         return 2
+    cfg = load(BANKROLL) if os.path.exists(BANKROLL) else None
+    if cfg:
+        api = Capped(api, cfg)
     if a.dry_run:
         api = DryRun(api)
     fn = {("check", None): check, ("status", None): status, ("test-buy", None): test_buy,
@@ -3009,7 +3140,9 @@ def main(argv=None, api=None):
           ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop,
           ("fcr", "start"): fcr_start, ("fcr", "run"): fcr_run, ("fcr", "stop"): fcr_stop,
           ("collar", "start"): collar_start, ("collar", "run"): collar_run, ("collar", "stop"): collar_stop,
-          ("notify", "setup"): notify_setup, ("notify", "test"): notify_test, ("notify", "off"): notify_off}[(a.cmd, getattr(a, "sub", None))]
+          ("notify", "setup"): notify_setup, ("notify", "test"): notify_test, ("notify", "off"): notify_off,
+          ("backtest", None): backtest,
+          ("bankroll", "set"): bankroll_set, ("bankroll", "show"): bankroll_show, ("bankroll", "off"): bankroll_off}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
