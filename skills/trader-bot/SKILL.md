@@ -391,6 +391,27 @@ subscribes to that topic. The alert text (symbol, side, size, prices) goes
 through ntfy.sh, and anyone with the topic name can read it. `notify test`
 sends one; `notify off` stops them. A failed alert never stops a trade.
 
+## Step 5m: a small account (bankroll)
+
+`bankroll set 500` in an account's folder caps the bots there: stock buys only
+while their positions fit inside the stake plus whatever the account has made
+or lost since; options and short sales are refused. `bankroll show` / `off`.
+Each folder is its own account (its own `trader/alpaca.env`, which the user
+creates), so one lab account and one capped growth account run side by side.
+Under $2,000 Alpaca allows no margin and no shorting; the PDT rule ended in
+June 2026, so day trades are allowed at any size.
+
+## Step 5n: backtests
+
+`backtest orb gap fcr candles|all --symbols ... --days 250` runs the day-trade
+rules (the bot's own entry checks) and four candle setups (engulfing, hammer,
+inside-bar break, VWAP reclaim) on Alpaca's 1-minute bars, with `--slip` per
+share on market fills and the stop counted first when a bar touches both.
+Results (win rate, average R, profit factor, drawdown, both halves of the
+period, dollars at `--dollars`/`--max-loss`) print and save to
+`trader/backtest/`. Say every time: past bars, not a prediction; a few dozen
+trades is a small sample.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using

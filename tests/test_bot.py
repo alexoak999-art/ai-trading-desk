@@ -1782,5 +1782,127 @@ class PtrPath(unittest.TestCase):
         self.assertTrue(bot.default_ptr().endswith(os.path.join("trader-pelosi", "ptr.py")))
 
 
+class FakeEquity(FakeAlpaca):
+    """Equity is cash plus what the stock positions are worth now."""
+
+    def account(self):
+        eq = self.cash + sum(float(p["qty"]) * self.prices[s] for s, p in self.pos.items())
+        return dict(super().account(), equity=str(eq))
+
+
+class Bankroll(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeEquity(cash=100000.0)
+        self.api.prices.update(SPY=100.0, AAPL=350.0)
+
+    def test_buys_stay_inside_the_stake(self):
+        rc, out = run(self.api, "bankroll", "set", "500")
+        self.assertIn("at most $500 plus what they make", out)
+        self.assertIn("$500.00 is free to use", out)
+        rc, out = run(self.api, "test-buy", "AAPL")  # one share, $350: fits
+        self.assertEqual(rc, 0, out)
+        rc, out = run(self.api, "test-buy", "AAPL")  # a second $350 share does not
+        self.assertEqual(rc, 2)
+        self.assertIn("bankroll: buying AAPL for about $350.00 is more than the $150.00 left", out)
+        self.assertEqual(len(self.api.sent), 1)
+
+    def test_profits_grow_the_room_and_losses_shrink_it(self):
+        run(self.api, "bankroll", "set", "500")
+        cfg = bot.load(bot.BANKROLL)
+        self.api.cash += 100  # the account made $100
+        play, used, room = bot.bankroll_room(self.api, cfg)
+        self.assertEqual((play, room), (600.0, 600.0))
+        self.api.cash -= 300
+        self.assertEqual(bot.bankroll_room(self.api, cfg)[0], 300.0)
+
+    def test_no_options_and_no_shorts(self):
+        run(self.api, "bankroll", "set", "500")
+        api = bot.Capped(self.api, bot.load(bot.BANKROLL))
+        with self.assertRaises(bot.alp.AlpacaError) as e:
+            api.submit_order(symbol="SPY261218P00090000", qty=1, side="sell", type="limit", limit_price="1.00",
+                             time_in_force="day")
+        self.assertIn("is an option; options are off", str(e.exception))
+        with self.assertRaises(bot.alp.AlpacaError) as e:
+            api.submit_order(symbol="SPY", qty=2, side="sell", type="market", time_in_force="day")
+        self.assertIn("short selling is off", str(e.exception))
+        api.submit_order(symbol="SPY", notional=200, side="buy", type="market", time_in_force="day")
+        api.submit_order(symbol="SPY", qty=2, side="sell", type="market", time_in_force="day")  # selling what you hold is fine
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_status_show_and_off(self):
+        run(self.api, "bankroll", "set", "500")
+        rc, out = run(self.api, "status")
+        self.assertIn("bankroll: stake $500 since", out)
+        self.assertIn("play money $500.00 (+0.00, +0.0%)", out)
+        rc, out = run(self.api, "bankroll", "off")
+        self.assertFalse(os.path.exists(bot.BANKROLL))
+        rc, out = run(self.api, "bankroll", "show")
+        self.assertIn("No bankroll", out)
+
+
+import backtest as bt  # noqa: E402
+
+
+def mins(start, rows):
+    """1-minute bars [[minute, o, h, l, c, v]] from an ET time."""
+    m0 = bt.to_m(start)
+    return [[m0 + i, o, h, l, c, 1000.0] for i, (o, h, l, c) in enumerate(rows)]
+
+
+BT_CFG = {"slip": 0.02, "dollars": 500, "max_loss": 5, "flat_by": "15:55",
+          "orb": {"range": 15, "stop": "mid", "target_r": 2, "last_entry": "11:30"},
+          "gap": {"range": 5, "stop": "open", "target_r": 2, "min_gap": 3, "max_gap": None, "last_entry": "10:30"},
+          "fcr": {"sides": "long", "target_r": 3, "last_entry": "11:30"},
+          "candles": {"target_r": 2, "last_entry": "15:00"}}
+
+
+class Backtest(unittest.TestCase):
+    def test_new_york_offset(self):
+        self.assertEqual(bt.et_offset(datetime.date(2026, 7, 1)), -4)
+        self.assertEqual(bt.et_offset(datetime.date(2026, 11, 24)), -5)
+        self.assertEqual(bt.et_offset(datetime.date(2026, 3, 8)), -4)  # 2nd Sunday of March 2026
+        self.assertEqual(bt.et_offset(datetime.date(2026, 3, 7)), -5)
+
+    def test_walk_stop_first_and_gaps_through(self):
+        def walk(*args):
+            px, how, m = bt.walk(*args)
+            return round(px, 2), how
+
+        bars = mins("10:00", [(100, 100.5, 99.0, 99.5)])  # touches the target? no; the stop at 99.5? yes
+        self.assertEqual(walk(bars, 0, 100, 99.5, 102, 955, 0.02), (99.48, "STOP"))
+        bars = mins("10:00", [(99.0, 99.2, 98.8, 99.1)])  # opened under the stop: fills at the open
+        self.assertEqual(walk(bars, 0, 100, 99.5, 102, 955, 0.02), (98.98, "STOP"))
+        bars = mins("10:00", [(100, 102.5, 99.0, 102)])  # both in one bar: the stop
+        self.assertEqual(bt.walk(bars, 0, 100, 99.5, 102, 955, 0.0)[1], "STOP")
+        bars = mins("15:54", [(100, 100.1, 99.9, 100), (100.4, 100.5, 100.3, 100.4)])
+        self.assertEqual(walk(bars, 0, 100, 99.5, 102, 955, 0.02), (100.38, "FLAT"))
+
+    def test_orb_day(self):
+        rng = [(50, 50.4, 49.8, 50.2)] * 15  # 9:30-9:45: high 50.40, low 49.80, mid 50.10
+        quiet = [(50.2, 50.3, 50.1, 50.2)] * 5  # 9:45-9:50 no breakout
+        brk = [(50.3, 50.5, 50.3, 50.45)] * 5  # 9:50-9:55 closes over 50.40
+        after = [(50.46, 50.6, 50.45, 50.55)] + [(50.6, 50.75, 50.6, 50.7)] * 30
+        bars = mins("09:30", rng + quiet + brk + after)
+        t = bt.orb_trades("XYZ", datetime.date(2026, 11, 2), bars, 960, BT_CFG)[0]
+        self.assertEqual((t["in"], t["entry"], t["stop"]), ("09:55", 50.48, 50.1))
+        self.assertEqual((t["target"], t["how"]), (51.24, "FLAT"))  # never reached; sold at the last bar
+        self.assertEqual(t["qty"], 9)  # min(500 // 50.48, 5 // 0.38) = min(9, 13)
+
+    def test_gap_needs_the_gap(self):
+        bars = mins("09:30", [(103, 103.5, 102.9, 103.4)] * 5 + [(103.5, 103.7, 103.45, 103.6)] * 5 + [(103.62, 103.8, 103.6, 103.7)] * 40)
+        d = datetime.date(2026, 11, 2)
+        self.assertEqual(bt.orb_trades("XYZ", d, bars, 960, BT_CFG, prev_close=101, gap=True), [])  # +2%
+        t = bt.orb_trades("XYZ", d, bars, 960, BT_CFG, prev_close=99, gap=True)[0]  # +4%
+        self.assertEqual((t["setup"], t["stop"], t["in"]), ("gap", 102.99, "09:40"))
+
+    def test_stats(self):
+        trades = [{"r": r, "how": "STOP" if r < 0 else "TARGET", "hold": 10, "qty": 1, "pnl": r, "day": "d%d" % i}
+                  for i, r in enumerate([2, -1, -1, -1, 2, 2])]
+        s = bt.stats(trades)
+        self.assertEqual((s["n"], s["win_pct"], s["avg_r"], s["pf"], s["max_dd_r"], s["worst_streak"]),
+                         (6, 50.0, 0.5, 2.0, -3.0, 3))
+
+
 if __name__ == "__main__":
     unittest.main()
