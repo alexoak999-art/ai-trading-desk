@@ -1364,6 +1364,203 @@ class Gap(InTmp):
         self.assertIn("Gap-and-go: no new trades", out)
 
 
+class FakeFcr(FakeOrb):
+    """1-minute bars, shortable assets, and bracket legs that work for shorts too."""
+
+    def __init__(self, cash=50000.0):
+        super().__init__(cash)
+        self.now = datetime.datetime(2026, 11, 24, 9, 42, tzinfo=ET)
+        self.hard_to_borrow = set()
+
+    def account(self):
+        return dict(super().account(), buying_power=str(self.cash * 2), shorting_enabled=True)
+
+    def asset(self, s):
+        return {"symbol": s, "tradable": True, "shortable": True, "easy_to_borrow": s not in self.hard_to_borrow}
+
+    def set_min_bars(self, s, rows):
+        t0 = self.now.replace(hour=9, minute=30)
+        self.bar_data[s] = [{"t": (t0 + datetime.timedelta(minutes=i)).astimezone(datetime.timezone.utc)
+                                  .isoformat().replace("+00:00", "Z"), "o": o, "h": h, "l": l, "c": c, "v": 100}
+                            for i, (o, h, l, c) in enumerate(rows)]
+
+    def submit_order(self, **o):
+        parent = super().submit_order(**o)
+        if o.get("order_class") == "bracket" and o["side"] == "sell":
+            for leg in parent["legs"]:
+                leg["side"] = "buy"
+        return parent
+
+    def move(self, s, price):
+        self.prices[s] = price
+        for o in list(self.orders.values()):
+            for leg in o.get("legs") or []:
+                if leg["status"] != "new" or leg["symbol"] != s:
+                    continue
+                short = leg["side"] == "buy"
+                if leg["type"] == "stop":
+                    hit = price >= float(leg["stop_price"]) if short else price <= float(leg["stop_price"])
+                else:
+                    hit = price <= float(leg["limit_price"]) if short else price >= float(leg["limit_price"])
+                if hit:
+                    px = float(leg.get("stop_price") or leg.get("limit_price"))
+                    self._fill(s, (1 if short else -1) * float(leg["qty"]), px)
+                    leg.update(status="filled", filled_avg_price=str(px))
+                    for other in o["legs"]:
+                        if other is not leg and other["status"] == "new":
+                            other["status"] = "canceled"
+
+
+FIRST = [(100, 100.6, 99.4, 100.2), (100.2, 101, 99.8, 100.5), (100.5, 100.8, 99, 99.6),
+         (99.6, 100.3, 99.5, 100.1), (100.1, 100.6, 99.9, 100.4)]  # 9:30-9:34: high 101, low 99
+LONG = FIRST + [(100.5, 100.9, 100.4, 100.8),   # 9:35 b0
+                (100.8, 101.8, 100.7, 101.7),   # 9:36 closes above 101
+                (101.7, 102.3, 101.2, 102.2),   # 9:37 low 101.2 > 100.9: gap 100.90-101.20
+                (102.2, 102.4, 101.9, 102.0),   # 9:38 no retest yet
+                (102.0, 102.0, 101.1, 101.3),   # 9:39 retest, down bar
+                (101.3, 102.15, 101.2, 102.1)]  # 9:40 engulfing
+SHORT = FIRST + [(99.5, 99.6, 99.1, 99.2),      # 9:35 b0
+                 (99.2, 99.3, 98.2, 98.3),      # 9:36 closes below 99
+                 (98.3, 98.8, 97.7, 97.8),      # 9:37 high 98.8 < 99.1: gap 98.80-99.10
+                 (97.8, 98.9, 97.7, 98.7),      # 9:38 retest, up bar
+                 (98.7, 98.75, 97.5, 97.6)]     # 9:39 bearish engulfing
+
+
+def fcr_after(api, sym):
+    return [b for b in api.bar_data[sym][5:]]
+
+
+class FcrScan(unittest.TestCase):
+    def setUp(self):
+        self.api = FakeFcr()
+
+    def test_long_gap_retest_engulfing(self):
+        self.api.set_min_bars("SPY", LONG)
+        state, info = bot.fcr_scan(fcr_after(self.api, "SPY"), 101, 1)
+        self.assertEqual(state, "trigger")
+        self.assertEqual(info["gap"], [100.9, 101.2])
+        self.assertEqual((info["close"], info["extreme"]), (102.1, 101.1))
+
+    def test_short_mirrors_it(self):
+        self.api.set_min_bars("QQQ", SHORT)
+        state, info = bot.fcr_scan(fcr_after(self.api, "QQQ"), 99, -1)
+        self.assertEqual(state, "trigger")
+        self.assertEqual(info["gap"], [98.8, 99.1])
+        self.assertEqual((info["close"], info["extreme"]), (97.6, 98.9))
+
+    def test_no_gap_or_a_close_through_it_is_no_trade(self):
+        self.api.set_min_bars("SPY", LONG[:9])
+        self.assertEqual(bot.fcr_scan(fcr_after(self.api, "SPY"), 101, 1)[0], "gap")
+        self.api.set_min_bars("SPY", LONG[:9] + [(102.0, 102.0, 100.5, 100.6)])  # closes under 100.90
+        self.assertEqual(bot.fcr_scan(fcr_after(self.api, "SPY"), 101, 1)[0], "none")
+        wick_only = FIRST + [(100.5, 100.9, 100.4, 100.8), (100.8, 101.3, 100.7, 100.9), (100.9, 101, 100.8, 100.9)]
+        self.api.set_min_bars("SPY", wick_only)
+        self.assertEqual(bot.fcr_scan(fcr_after(self.api, "SPY"), 101, 1)[0], "none")
+
+
+class Fcr(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeFcr()
+        self.api.prices.update(SPY=102.1, QQQ=97.6)
+        self.api.set_min_bars("SPY", LONG)
+        self.api.set_min_bars("QQQ", FIRST)
+
+    def start(self, *extra):
+        rc, out = run(self.api, "fcr", "start", "SPY", "QQQ", *extra)
+        self.assertEqual(rc, 0, out)
+
+    def test_waits_for_the_first_candle(self):
+        self.start()
+        self.api.now = self.api.now.replace(minute=36)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("first gap check is at 09:38", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_long_entry_is_a_bracket_sized_by_risk(self):
+        self.start()
+        rc, out = run(self.api, "fcr", "run")
+        # stop 101.09 (retest low 101.10 - 0.01); risk 1.01; $2000 / 102.1 = 19 shares; target 102.1 + 3 * 1.01
+        self.assertIn("SPY: FIRST CANDLE BREAK UP (candle 99.00-101.00; gap 100.90-101.20 at 09:36, retested, "
+                      "engulfing at 09:40) -> BUY 19 at about 102.10; stop 101.09, target 105.13 (3R)", out)
+        self.assertIn("QQQ: first candle 99.00-101.00; no gap through it yet", out)
+        o = self.api.sent[0]
+        self.assertEqual((o["side"], o["order_class"], o["qty"]), ("buy", "bracket", 19))
+        self.assertEqual((o["stop_loss"]["stop_price"], o["take_profit"]["limit_price"]), ("101.09", "105.13"))
+        self.assertEqual(bot.strategy_symbols().get("SPY"), "fcr")
+
+    def test_short_entry_then_stopped_out(self):
+        self.api.set_min_bars("SPY", FIRST)
+        self.api.set_min_bars("QQQ", SHORT)
+        self.api.now = self.api.now.replace(minute=41)
+        self.start()
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("QQQ: FIRST CANDLE BREAK DOWN", out)
+        self.assertIn("SHORT 20 at about 97.60; stop 98.91, target 93.67 (3R)", out)
+        o = self.api.sent[0]
+        self.assertEqual((o["side"], o["qty"]), ("sell", 20))
+        self.assertEqual(float(self.api.position("QQQ")["qty"]), -20)
+        self.api.move("QQQ", 99.0)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("QQQ: SHORT STOPPED OUT at about 98.91: -1.00R, $-26.20", out)
+        self.assertIsNone(self.api.position("QQQ"))
+
+    def test_short_target(self):
+        self.api.set_min_bars("QQQ", SHORT)
+        self.api.now = self.api.now.replace(minute=41)
+        self.start()
+        run(self.api, "fcr", "run")
+        self.api.move("QQQ", 93.5)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("QQQ: SHORT TARGET HIT at about 93.67: +3.00R", out)
+
+    def test_long_only_ignores_short_setups(self):
+        self.api.set_min_bars("QQQ", SHORT)
+        self.api.now = self.api.now.replace(minute=41)
+        self.start("--sides", "long")
+        rc, out = run(self.api, "fcr", "run")
+        self.assertNotIn("SHORT", out)
+        self.assertFalse(any(o.get("symbol") == "QQQ" for o in self.api.sent))
+
+    def test_hard_to_borrow_is_not_shorted(self):
+        self.api.set_min_bars("QQQ", SHORT)
+        self.api.hard_to_borrow.add("QQQ")
+        self.api.now = self.api.now.replace(minute=41)
+        self.start()
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("QQQ: short setup at 09:39, but Alpaca won't short it now", out)
+        self.assertFalse(any(o.get("symbol") == "QQQ" for o in self.api.sent))
+
+    def test_stale_setup_is_missed_for_the_day(self):
+        self.start()
+        self.api.now = self.api.now.replace(minute=50)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("SPY: long setup's engulfing candle was at 09:40, more than 3 minutes ago; missed", out)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertNotIn("SPY", out)
+        self.assertEqual(self.api.sent, [])
+
+    def test_flat_by_covers_a_short(self):
+        self.api.set_min_bars("QQQ", SHORT)
+        self.api.now = self.api.now.replace(minute=41)
+        self.start()
+        run(self.api, "fcr", "run")
+        self.api.prices["QQQ"] = 96.0
+        self.api.now = self.api.now.replace(hour=15, minute=55)
+        rc, out = run(self.api, "fcr", "run")
+        self.assertIn("QQQ: SHORT FLAT BY 15:55 at about 96.00", out)
+        self.assertEqual([o["side"] for o in self.api.sent if o.get("symbol") == "QQQ"], ["sell", "buy"])
+        self.assertIsNone(self.api.position("QQQ"))
+
+    def test_status_and_stop(self):
+        self.start()
+        run(self.api, "fcr", "run")
+        rc, out = run(self.api, "status")
+        self.assertIn("fcr: on, watching QQQ, SPY; today (2026-11-24): SPY open", out)
+        rc, out = run(self.api, "fcr", "stop")
+        self.assertIn("no new trades", out)
+
+
 class PtrPath(unittest.TestCase):
     def setUp(self):
         self._env = dict(os.environ)

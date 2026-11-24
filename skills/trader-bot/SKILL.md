@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs eleven rule-based strategies on a schedule: a
+  a one-share buy, then runs twelve rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -25,7 +25,10 @@ description: >-
   breaks its first 5 minutes' high, stop just under the open, 2R target,
   flat by 3:55 PM), and momentum rotation (rank a list of names by their
   ~6-month return each month, hold the top few, sell what drops out, cash
-  when nothing is up). Paper account only. Use when the user says "trading bot",
+  when nothing is up), and the First Candle Rule (the 9:30-9:35 candle's
+  high and low, then a 1-minute break that leaves a fair value gap, a retest
+  and an engulfing candle; long or short, 3R target, flat by 3:55 PM).
+  Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
   "covered calls", "trend swing", "swing trade the 200-day", "opening range
@@ -33,8 +36,9 @@ description: >-
   dip on RSI", "dollar-cost averaging", "DCA", "buy every week", "covered calls
   only", "sell calls on my shares", "rebalance",
   "target weights", "60/40", "gap and go",
-  "trade the gappers", "momentum rotation", "sector rotation", "hold the leaders", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | rotate | status]"
+  "trade the gappers", "momentum rotation", "sector rotation", "hold the leaders", "first candle rule",
+  "FVG", "fair value gap", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | rotate | fcr | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -317,6 +321,36 @@ user picks the names (often sector or asset-class ETFs); do not pick for them.
    next rotation, so a holding can fall a lot within a month.
 4. `rotate stop` ends the trading; what it holds stays in the account.
 
+## Step 5j: strategy 12, the First Candle Rule (day trade, long and short)
+
+From a short video ("5 min FVG break"). `fcr start SYMBOL ...` stores the
+plan; `fcr run` every minute in market hours does the work. The user picks
+the names; do not pick for them. The video's "$100,000 in a month" is the
+creator's claim, not something this bot or its tests show.
+
+1. **Levels**: the high and low of the first 5-minute candle, 9:30-9:35 ET
+   (built from 1-minute IEX bars). The only levels for the day.
+2. **Gap**: on completed 1-minute bars, a break through a level that leaves a
+   fair value gap: bar 1 starts at the level, bar 2 closes through it, and
+   bar 3 leaves a gap between its wick and bar 1's (up: bar 3's low above
+   bar 1's high). A wick or a close through the level alone is not enough.
+   A later close back through the far side of the gap cancels it.
+3. **Entry**: price retests the gap, then an engulfing candle in the break's
+   direction (within 15 bars). Enter at market if that candle finished in the
+   last 3 minutes and price has not run half a risk unit past its close;
+   otherwise the name is done for the day. No new entries from
+   `--last-entry` (11:30 ET).
+4. **The order**: one bracket at Alpaca. Long: buy, stop a cent under the
+   retest's low. Short (`--sides both`, the default): sell short, stop a cent
+   over the retest's high; only names Alpaca marks easy to borrow. Target
+   `--target-r` (3) times the risk. Size: the smaller of `--dollars` (2000)
+   and `--max-loss` (100) / risk per share, whole shares.
+5. **Limits and exit**: `--max-trades` (3) a day, one per name, never a name
+   another strategy holds; everything closed by `--flat-by` (15:55).
+
+The free IEX feed carries a few percent of the volume, so its 1-minute bars
+can show gaps the full tape does not, and the other way round.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -336,6 +370,7 @@ as a Mac mini), with the user's own folder:
 */15 * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py cc run >> trader/bot/cron.log 2>&1
 5 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rebal run >> trader/bot/cron.log 2>&1
 10 10 * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rotate run >> trader/bot/cron.log 2>&1
+* 9-15 * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py fcr run >> trader/bot/cron.log 2>&1
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py gap run >> trader/bot/cron.log 2>&1
 ```
 

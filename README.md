@@ -16,7 +16,7 @@ desk summary per name, and records paper trades only when you say so
 
 ## Trading bot (`/trader-bot`)
 
-An Alpaca **paper-trading** bot with eleven strategies, three rebuilt from a
+An Alpaca **paper-trading** bot with twelve strategies, three rebuilt from a
 Claude course video: a trailing stop with ladder buys (the stop is a real order
 at Alpaca), copying stock trades members of Congress disclose, the options
 wheel, a trend swing that trades the technical agent's 200-day /
@@ -26,7 +26,8 @@ by 3:55 PM), and an oversold bounce (RSI 14 under 30, then an up close; 5%
 stop, out at the 20-day average), and dollar-cost averaging as the buy-and-hold
 baseline, covered calls on shares you hold, rebalancing to target
 weights, a gap-and-go day trade, and momentum rotation (hold the top names
-by 6-month return, monthly). Keys go in `trader/alpaca.env`, never in the chat; there is no live
+by 6-month return, monthly), and the First Candle Rule (a 5-minute candle's
+fair-value-gap break, long and short, 3R). Keys go in `trader/alpaca.env`, never in the chat; there is no live
 trading address in the code. Step-by-step setup: `skills/trader-bot/SKILL.md`.
 
 ## Install (Claude Code)

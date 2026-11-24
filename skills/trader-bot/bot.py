@@ -2,8 +2,8 @@
 """Paper-trading bot on Alpaca: trailing stop with ladder buys, copying Congress
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
 day trade, an oversold bounce, dollar-cost averaging, covered calls,
-rebalancing to target weights, a gap-and-go day trade, and momentum rotation.
-PAPER ACCOUNT ONLY.
+rebalancing to target weights, a gap-and-go day trade, momentum rotation, and
+the First Candle Rule (a 5-minute fair-value-gap break, long and short). PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -36,6 +36,9 @@ PAPER ACCOUNT ONLY.
   python bot.py rotate start XLK XLF XLE XLV --top 2 --lookback 126 --dollars 10000 --every monthly --day 1
   python bot.py rotate run                              # once a day; trades only on its dates
   python bot.py rotate stop                             # no more trades; holdings stay
+  python bot.py fcr start SPY QQQ --sides both --target-r 3 --max-loss 100 --last-entry 11:30
+  python bot.py fcr run                                 # every minute in market hours
+  python bot.py fcr stop                                # no new trades; open ones still closed by 15:55
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -577,8 +580,9 @@ def strategy_symbols():
             out[st["symbol"]] = f.split("-")[0]
         elif f in ("swing.json", "bounce.json"):
             out.update({s: f[:-5] for s in st.get("positions", {})})
-        elif f in ("orb.json", "gap.json"):
-            out.update({s: f[:-5] for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "buying")})
+        elif f in ("orb.json", "gap.json", "fcr.json"):
+            out.update({s: f[:-5] for s, t in (st.get("today") or {}).items()
+                        if t["status"] in ("open", "buying", "entering")})
         elif f == "dca.json" and st.get("status") == "on":
             out.update({s: "dca" for s in st.get("weights", {})})
         elif f == "rebal.json" and (st.get("status") == "on" or any(st.get("shares", {}).values())):
@@ -2028,6 +2032,291 @@ def gap_stop(api, a):
     return day_plan_stop(api, a, GAP, "gap-and-go")
 
 
+# ---------------------------------------------------------------- strategy 12: first candle rule (5-min FVG break)
+
+FCR = os.path.join(DIR, "fcr.json")
+MIN1 = datetime.timedelta(minutes=1)
+
+
+def _bar(b, sign):
+    """A 1-minute bar as floats; for the short side, mirrored (prices negated) so one long-side scan does both."""
+    o, h, l, c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+    return {"t": b["t"], "o": o, "h": h, "l": l, "c": c} if sign > 0 else \
+        {"t": b["t"], "o": -o, "h": -l, "l": -h, "c": -c}
+
+
+def fcr_scan(bars, level, sign, max_wait=15):
+    """Long-side scan of completed 1-minute bars after 9:35 (mirrored for shorts):
+    1. a fair value gap through the level: bars b0, b1, b2 with b0's low at or under the level, b1 closing
+       above it, and b2's low above b0's high (the gap is b0.high .. b2.low);
+    2. a retest: a later bar trading back into the gap (low at or under its top);
+    3. an engulfing candle at or after the retest: up bar after a down bar, closing at or above that bar's
+       open and opening at or under its close.
+    A close below the gap's bottom, or no engulfing within `max_wait` bars of the retest, drops the setup.
+    Returns ("trigger" | "retest" | "gap" | "none", info) in real prices."""
+    bs = [_bar(b, sign) for b in bars]
+    lvl = level * sign
+    setup = None
+    for i, b in enumerate(bs):
+        if setup is None:
+            if i >= 2:
+                b0, b1 = bs[i - 2], bs[i - 1]
+                if b0["l"] <= lvl < b1["c"] and b["l"] > b0["h"]:
+                    setup = {"bottom": b0["h"], "top": b["l"], "at": b1["t"], "retest": None, "low": None}
+            continue
+        if b["c"] < setup["bottom"]:
+            setup = None  # closed through the gap: the break failed
+            continue
+        if setup["retest"] is None:
+            if b["l"] > setup["top"]:
+                continue
+            setup.update(retest=i, retest_at=b["t"], low=b["l"])
+        else:
+            setup["low"] = min(setup["low"], b["l"])
+        p = bs[i - 1]
+        if b["c"] > b["o"] and p["c"] < p["o"] and b["c"] >= p["o"] and b["o"] <= p["c"] + 0.01:
+            info = {"gap": sorted([setup["bottom"] * sign, setup["top"] * sign]), "gap_at": setup["at"],
+                    "retest_at": setup["retest_at"], "engulf_at": b["t"], "close": b["c"] * sign,
+                    "extreme": setup["low"] * sign}
+            return "trigger", info
+        if i - setup["retest"] >= max_wait:
+            setup = None
+    if setup is None:
+        return "none", {}
+    return ("retest" if setup["retest"] is not None else "gap"), {
+        "gap": sorted([setup["bottom"] * sign, setup["top"] * sign]), "gap_at": setup["at"]}
+
+
+def fcr_close(st, sym, t, px, how, dry):
+    sign = 1 if t["side"] == "long" else -1
+    risk = (t["entry"] - t["stop"]) * sign
+    t.update(status="closed", exit=money(px), how=how, r=round((px - t["entry"]) * sign / risk, 2) if risk > 0 else 0,
+             pnl=money((px - t["entry"]) * sign * t["qty"]))
+    st["history"].append(dict(t, symbol=sym))
+    log("fcr_exit", symbol=sym, side=t["side"], qty=t["qty"], entry=t["entry"], exit=money(px), how=how,
+        r=t["r"], pnl=t["pnl"], dry_run=dry)
+    return "%s: %s %s at about %.2f: %+.2fR, $%+.2f." % (sym, t["side"].upper(), how, px, t["r"], t["pnl"])
+
+
+def fcr_manage(api, st, sym, t, now, today, flat_by, dry):
+    """One open or pending trade: record a fill, a bracket exit, or flatten at the flat-by time."""
+    sign = 1 if t["side"] == "long" else -1
+    parent = api.order(t["order_id"]) or {}
+    if t["status"] == "entering":
+        if parent.get("status") == "filled":
+            t.update(status="open", entry=money(float(parent["filled_avg_price"])))
+        elif parent.get("status") in LIVE and now < flat_by:
+            return "%s: waiting for the entry to fill." % sym
+        else:
+            if parent.get("status") in LIVE:
+                api.cancel_order(t["order_id"])
+            t["status"] = "canceled"
+            return "%s: the entry order ended %s; no trade." % (sym, parent.get("status", "unfilled"))
+    pos = api.position(sym)
+    qty = abs(int(float(pos["qty"]))) if pos and float(pos["qty"]) * sign > 0 else 0
+    if qty <= 0:
+        px, how = t["stop"], "CLOSED"
+        for leg in parent.get("legs") or []:
+            if leg.get("status") == "filled":
+                px = float(leg.get("filled_avg_price") or px)
+                how = "TARGET HIT" if leg.get("type") == "limit" else "STOPPED OUT"
+        return fcr_close(st, sym, t, px, how, dry)
+    if now >= flat_by or t["day"] != today:
+        for leg in parent.get("legs") or []:
+            if leg.get("status") in LIVE:
+                api.cancel_order(leg["id"])
+                wait_canceled(api, leg["id"], dry)
+        if not dry:
+            pos = api.position(sym)
+            qty = abs(int(float(pos["qty"]))) if pos else 0
+            if qty <= 0:
+                return "%s: a bracket leg filled first; the next run records it." % sym
+        o = wait_fill(api, api.submit_order(symbol=sym, qty=qty, side="sell" if sign > 0 else "buy",
+                                            type="market", time_in_force="day"))
+        px = float(o.get("filled_avg_price") or api.last_price(sym))
+        return fcr_close(st, sym, t, px, "FLAT BY %s" % st["flat_by"] if t["day"] == today
+                         else "LEFT OVER FROM %s, CLOSED" % t["day"], dry)
+    price = api.last_price(sym)
+    return "%s: %s %d @ %.2f, now %.2f (%+.2fR); stop %.2f, target %.2f at Alpaca." % (
+        sym, t["side"], qty, t["entry"], price, (price - t["entry"]) * sign / ((t["entry"] - t["stop"]) * sign),
+        t["stop"], t["target"])
+
+
+def fcr_step(api, st, now, dry):
+    out, today = [], now.date().isoformat()
+    if st.get("day") != today:
+        st["today"] = {s: t for s, t in (st.get("today") or {}).items() if t["status"] in ("open", "entering")}
+        st["day"] = today
+    trades = st["today"]
+    open_dt, first_end = at(now, "09:30"), at(now, "09:35")
+    flat_by, last_entry = at(now, st["flat_by"]), at(now, st["last_entry"])
+
+    for sym in sorted(trades):
+        if trades[sym]["status"] in ("open", "entering"):
+            out.append(fcr_manage(api, st, sym, trades[sym], now, today, flat_by, dry))
+
+    if st.get("status") != "on":
+        return out
+    waiting = [s for s in st["symbols"] if s not in trades]
+    if not waiting:
+        return out
+    if now < first_end + 3 * MIN1:
+        out.append("Waiting for the 9:30-9:35 candle to close; the first gap check is at %s."
+                   % (first_end + 3 * MIN1).strftime("%H:%M"))
+        return out
+    if now >= last_entry:
+        out.append("Past the last entry time (%s); no new trades today." % st["last_entry"])
+        return out
+    taken = len(trades)
+    busy = other_bot_symbols()
+    acct = api.account() or {}
+    power = float(acct.get("buying_power") or acct.get("cash") or 0)
+    for sym in waiting:
+        if taken >= st["max_trades"]:
+            out.append("%d trades taken today (the max); no more." % st["max_trades"])
+            break
+        if sym in busy or api.position(sym):
+            out.append("%s: held or traded by another strategy; skipped." % sym)
+            continue
+        bars = api.bars(sym, open_dt.isoformat(), now.isoformat(), timeframe="1Min")
+        first = [b for b in bars if open_dt <= parse_ts(b["t"]) < first_end]
+        after = [b for b in bars if parse_ts(b["t"]) >= first_end and parse_ts(b["t"]) + MIN1 <= now]
+        if not first:
+            out.append("%s: no bars in the first 5 minutes (IEX feed); skipped." % sym)
+            continue
+        hi, lo = max(float(b["h"]) for b in first), min(float(b["l"]) for b in first)
+        found, notes = None, []
+        for side, sign, level in (("long", 1, hi), ("short", -1, lo)):
+            if side == "short" and st["sides"] != "both":
+                continue
+            state, info = fcr_scan(after, level, sign)
+            if state == "trigger":
+                if not found or info["engulf_at"] < found[2]["engulf_at"]:
+                    found = (side, sign, info)
+            elif state in ("gap", "retest"):
+                notes.append("%s gap %.2f-%.2f (%s), %s" % (
+                    side, info["gap"][0], info["gap"][1],
+                    parse_ts(info["gap_at"]).astimezone(now.tzinfo).strftime("%H:%M"),
+                    "waiting for an engulfing candle" if state == "retest" else "waiting for a retest"))
+        if not found:
+            out.append("%s: first candle %.2f-%.2f; %s." % (sym, lo, hi, "; ".join(notes) or "no gap through it yet"))
+            continue
+        side, sign, info = found
+        eng_t = parse_ts(info["engulf_at"]).astimezone(now.tzinfo)
+        eng_at = eng_t.strftime("%H:%M")
+        if eng_t + MIN1 < now - 3 * MIN1:
+            out.append("%s: %s setup's engulfing candle was at %s, more than 3 minutes ago; missed, no entry today."
+                       % (sym, side, eng_at))
+            trades[sym] = {"day": today, "side": side, "status": "missed", "engulf": eng_at}
+            continue
+        price = api.last_price(sym)
+        stop = money(info["extreme"] - 0.01 * sign)
+        risk = (price - stop) * sign
+        if risk <= max(0.02, price * 0.0005):
+            out.append("%s: %s setup at %s, but %.2f is at or past the stop %.2f; no entry." % (
+                sym, side, eng_at, price, stop))
+            continue
+        if (price - info["close"]) * sign > 0.5 * (info["close"] - stop) * sign:
+            out.append("%s: %s setup at %s, but %.2f has run more than half a risk unit past the engulfing "
+                       "close %.2f; not chasing." % (sym, side, eng_at, price, info["close"]))
+            continue
+        if side == "short":
+            asset = api.asset(sym) or {}
+            if not (asset.get("shortable") and asset.get("easy_to_borrow")) or acct.get("shorting_enabled") is False:
+                out.append("%s: short setup at %s, but Alpaca won't short it now (not easy to borrow, or "
+                           "shorting off); skipped." % (sym, eng_at))
+                continue
+        qty = min(int(st["dollars"] // price), int(st["max_loss"] // risk))
+        if qty < 1:
+            out.append("%s: %s setup, but $%g of risk with a %.2f stop buys no whole share." % (
+                sym, side, st["max_loss"], risk))
+            continue
+        if qty * price > power:
+            out.append("%s: %s setup, but %d shares need $%.0f and buying power is $%.0f." % (
+                sym, side, qty, qty * price, power))
+            continue
+        target = money(price + st["target_r"] * risk * sign)
+        o = wait_fill(api, api.submit_order(
+            symbol=sym, qty=qty, side="buy" if sign > 0 else "sell", type="market", time_in_force="gtc",
+            order_class="bracket", take_profit={"limit_price": "%.2f" % target},
+            stop_loss={"stop_price": "%.2f" % stop}))
+        filled = o.get("status") in ("filled", "dry_run")
+        entry = money(float(o.get("filled_avg_price") or price))
+        trades[sym] = {"day": today, "side": side, "qty": qty, "entry": entry, "stop": stop, "target": target,
+                       "order_id": o.get("id"), "first": [money(lo), money(hi)], "gap": [money(x) for x in info["gap"]],
+                       "engulf": eng_at, "status": "open" if filled else "entering"}
+        taken, power = taken + 1, power - qty * entry
+        log("fcr_entry", symbol=sym, side=side, qty=qty, entry=entry, stop=stop, target=target,
+            first_high=money(hi), first_low=money(lo), dry_run=dry)
+        out.append("%s: FIRST CANDLE %s (candle %.2f-%.2f; gap %.2f-%.2f at %s, retested, engulfing at %s) -> "
+                   "%s %d at about %.2f; stop %.2f, target %.2f (%gR) held at Alpaca; risk $%.0f; flat by %s." % (
+                       sym, "BREAK UP" if sign > 0 else "BREAK DOWN", lo, hi, info["gap"][0], info["gap"][1],
+                       parse_ts(info["gap_at"]).astimezone(now.tzinfo).strftime("%H:%M"), eng_at,
+                       ("WOULD " if dry else "") + ("BUY" if sign > 0 else "SHORT"), qty, entry, stop, target,
+                       st["target_r"], qty * risk, st["flat_by"]))
+    return out
+
+
+def fcr_start(api, a):
+    syms = sorted({s.upper() for s in a.symbols})
+    errs = []
+    if a.target_r <= 0 or a.dollars <= 0 or a.max_loss <= 0 or a.max_trades < 1:
+        errs.append("--target-r, --dollars, --max-loss and --max-trades must be positive")
+    try:
+        le, fb = (datetime.time(*(int(x) for x in v.split(":"))) for v in (a.last_entry, a.flat_by))
+        if not datetime.time(9, 40) <= le < fb <= datetime.time(16, 0):
+            errs.append("times must run 9:40 <= --last-entry < --flat-by <= 16:00")
+    except ValueError:
+        errs.append("--last-entry and --flat-by are HH:MM, New York time")
+    for e in errs:
+        say("fcr: " + e)
+    if errs:
+        return 1
+    st = load(FCR) or {"today": {}, "history": [], "day": None}
+    st.update(kind="fcr", symbols=syms, sides=a.sides, target_r=a.target_r, dollars=a.dollars,
+              max_loss=a.max_loss, max_trades=a.max_trades, last_entry=a.last_entry, flat_by=a.flat_by, status="on")
+    if not a.dry_run:
+        save(FCR, st)
+    say("First Candle Rule on %s: mark the high and low of the 9:30-9:35 candle; on 1-minute bars wait for a "
+        "break that leaves a fair value gap, a retest of that gap and an engulfing candle, then %s at market "
+        "(until %s), stop just past the retest's extreme, target %gR, as one bracket order at Alpaca. Up to $%g "
+        "a trade and $%g of risk, %d trades a day, one per name. Everything is closed by %s." % (
+            ", ".join(syms), "buy (break up) or short (break down)" if a.sides == "both" else "buy (break up only)",
+            a.last_entry, a.target_r, a.dollars, a.max_loss, a.max_trades, a.flat_by))
+    if a.dry_run:
+        say("Preview of a `fcr run` now (nothing is saved or sent):")
+        for m in fcr_step(api, st, et_now(api), True):
+            say(m)
+    return 0
+
+
+def fcr_run(api, a):
+    st = load(FCR)
+    if not st or (st.get("status") != "on" and not any(
+            t["status"] in ("open", "entering") for t in (st.get("today") or {}).values())):
+        say("No First Candle Rule plan. Start one with `fcr start SYMBOL ...`.")
+        return 0
+    if not market_open(api):
+        return 0
+    for m in fcr_step(api, st, et_now(api), a.dry_run):
+        say(m)
+    if not a.dry_run:
+        save(FCR, st)
+    return 0
+
+
+def fcr_stop(api, a):
+    st = load(FCR)
+    if not st:
+        say("No First Candle Rule plan.")
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(FCR, st)
+    say("First Candle Rule: no new trades. Anything open keeps its bracket and is still closed by %s." % st["flat_by"])
+    return 0
+
+
 # ---------------------------------------------------------------- check / status
 
 def check(api, a):
@@ -2114,7 +2403,7 @@ def status(api, a):
                 ", ".join("%s %d @ %.2f" % (s, p["qty"], p["entry"]) for s, p in sorted(st["positions"].items()))
                 or "nothing", len(closed),
                 " (avg %+.1f%%)" % (sum(c["ret_pct"] for c in closed) / len(closed)) if closed else ""))
-        elif f in ("orb.json", "gap.json"):
+        elif f in ("orb.json", "gap.json", "fcr.json"):
             hist = st.get("history", [])
             say(f[:-5] + ": %s, watching %s; today (%s): %s; past trades %d%s" % (
                 st.get("status"), ", ".join(st.get("symbols", [])), st.get("day"),
@@ -2240,6 +2529,20 @@ def parser():
     m.add_parser("run")
     m.add_parser("stop")
 
+    f = sub.add_parser("fcr").add_subparsers(dest="sub", required=True)
+    p = f.add_parser("start")
+    p.add_argument("symbols", nargs="+")
+    p.add_argument("--sides", choices=("both", "long"), default="both",
+                   help="trade breaks both ways (default; shorts on a break down) or long only")
+    p.add_argument("--target-r", type=float, default=3, help="target, in multiples of the risk (default 3)")
+    p.add_argument("--dollars", type=float, default=2000, help="most dollars in one trade (default 2000)")
+    p.add_argument("--max-loss", type=float, default=100, help="most dollars lost at the stop (default 100)")
+    p.add_argument("--max-trades", type=int, default=3, help="trades a day at most (default 3)")
+    p.add_argument("--last-entry", default="11:30", help="no new entries from this time, ET (default 11:30)")
+    p.add_argument("--flat-by", default="15:55", help="close everything by this time, ET (default 15:55)")
+    f.add_parser("run")
+    f.add_parser("stop")
+
     g = sub.add_parser("gap").add_subparsers(dest="sub", required=True)
     p = g.add_parser("start")
     p.add_argument("symbols", nargs="+")
@@ -2291,7 +2594,8 @@ def main(argv=None, api=None):
           ("cc", "start"): cc_start, ("cc", "run"): cc_run, ("cc", "stop"): cc_stop,
           ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop,
           ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop,
-          ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop,
+          ("fcr", "start"): fcr_start, ("fcr", "run"): fcr_run, ("fcr", "stop"): fcr_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:
