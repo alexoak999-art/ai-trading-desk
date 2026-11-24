@@ -43,6 +43,8 @@ protective collar (a put under 100 shares paid for by a call over them). PAPER A
   python bot.py collar start AAPL --put-otm 10 --call-otm 10 --dte 30-60 --max-debit 0.5 [--buy-shares]
   python bot.py collar run                              # every 15 min in market hours
   python bot.py collar stop AAPL                        # no new collars; the open one runs to expiration
+  python bot.py notify setup [--phone]                  # a pop-up (and phone push) for every order
+  python bot.py notify test | off
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -88,6 +90,122 @@ def log(event, **kw):
     kw.update(event=event, at=datetime.datetime.now().replace(microsecond=0).isoformat())
     with open(LOG, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(kw) + "\n")
+    if not kw.get("dry_run") and event not in QUIET:
+        alert(event, kw)
+
+
+# ---------------------------------------------------------------- trade alerts (Windows pop-up, ntfy push)
+
+NOTIFY = "trader/notify.json"
+QUIET = ("trail_raise", "error")  # not trades: a stop moved up, a failed run
+ALERT_KEYS = ("symbol", "ticker", "side", "kind", "qty", "dollars", "value", "price", "entry", "exit", "limit",
+              "strike", "stop", "target", "how", "reason", "r", "pnl")
+TOAST = r"""
+$ErrorActionPreference = 'Stop'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$x = $t.GetElementsByTagName('text')
+$x.Item(0).AppendChild($t.CreateTextNode($env:TB_TITLE)) > $null
+$x.Item(1).AppendChild($t.CreateTextNode($env:TB_BODY)) > $null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))
+"""
+
+
+def alert_text(event, kw):
+    """('Trade bot: ORB ENTRY', 'AMZN | qty 7 | entry 253.90 | stop 251.97 | target 258.06')."""
+    strat, _, action = event.partition("_")
+    title = "Trade bot: %s %s" % (strat.upper(), action.replace("_", " ").upper())
+    parts = []
+    for k in ALERT_KEYS:
+        v = kw.get(k)
+        if v is None or v == "":
+            continue
+        if k in ("symbol", "ticker"):
+            parts.insert(0, str(v))
+        elif isinstance(v, float):
+            parts.append("%s %s" % (k, ("%.4f" % v).rstrip("0").rstrip(".") if k == "qty" else "%.2f" % v))
+        else:
+            parts.append("%s %s" % (k, v))
+    return title, " | ".join(parts) or event
+
+
+def send_toast(title, body):
+    if sys.platform != "win32":
+        return
+    env = dict(os.environ, TB_TITLE=title, TB_BODY=body)
+    subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", TOAST], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
+
+
+def send_ntfy(server, topic, title, body):
+    import urllib.request
+    req = urllib.request.Request("%s/%s" % (server.rstrip("/"), topic), data=body.encode("utf-8"), method="POST",
+                                 headers={"Title": title.encode("ascii", "replace").decode(), "Tags": "chart_with_upwards_trend"})
+    urllib.request.urlopen(req, timeout=5).read()
+
+
+def alert(event, kw):
+    """A pop-up and/or a phone push for one trade, if trader/notify.json turns them on. Never stops the bot."""
+    cfg = load(NOTIFY) if os.path.exists(NOTIFY) else None
+    if not cfg:
+        return
+    title, body = alert_text(event, kw)
+    try:
+        if cfg.get("windows"):
+            send_toast(title, body)
+    except Exception:
+        pass
+    try:
+        if cfg.get("ntfy_topic"):
+            send_ntfy(cfg.get("ntfy_server") or "https://ntfy.sh", cfg["ntfy_topic"], title, body)
+    except Exception:
+        pass
+
+
+def notify_setup(api, a):
+    import secrets
+    cfg = load(NOTIFY) or {}
+    cfg["windows"] = not a.no_windows
+    if a.phone:
+        cfg.setdefault("ntfy_topic", "tradebot-" + secrets.token_hex(8))
+        cfg.setdefault("ntfy_server", "https://ntfy.sh")
+    else:
+        cfg.pop("ntfy_topic", None)
+    save(NOTIFY, cfg)
+    say("Trade alerts on: %s." % ", ".join(
+        (["Windows pop-ups"] if cfg["windows"] else []) + (["phone push via ntfy"] if cfg.get("ntfy_topic") else [])
+    ) if cfg["windows"] or cfg.get("ntfy_topic") else "Trade alerts off.")
+    if cfg.get("ntfy_topic"):
+        say("On your phone: install the ntfy app, tap +, and subscribe to the topic %s (server %s). Anyone who knows "
+            "the topic name can read the alerts, so keep it to yourself. It is kept in %s." % (
+                cfg["ntfy_topic"], cfg["ntfy_server"], NOTIFY))
+    return 0
+
+
+def notify_test(api, a):
+    cfg = load(NOTIFY)
+    if not cfg:
+        say("Trade alerts are off. Turn them on with `notify setup` (add --phone for a phone push).")
+        return 1
+    title, body = "Trade bot: TEST", "Alerts work. You'll get one like this for every order the bots place."
+    if cfg.get("windows"):
+        send_toast(title, body)
+    if cfg.get("ntfy_topic"):
+        try:
+            send_ntfy(cfg.get("ntfy_server") or "https://ntfy.sh", cfg["ntfy_topic"], title, body)
+        except Exception as e:
+            say("The phone push failed: %s" % e)
+            return 1
+    say("Test alert sent%s." % (" (pop-up and phone)" if cfg.get("windows") and cfg.get("ntfy_topic") else ""))
+    return 0
+
+
+def notify_off(api, a):
+    if os.path.exists(NOTIFY):
+        os.remove(NOTIFY)
+    say("Trade alerts off.")
+    return 0
 
 
 def say(msg):
@@ -474,6 +592,7 @@ def wheel_step(api, st, today, dry):
                 st["history"].append({"date": today.isoformat(), "event": "put assigned",
                                       "strike": op["strike"], "cost_basis": st["cost_basis"]})
                 msg = "ASSIGNED: bought %d %s at %.2f; cost after premiums %.2f." % (100 * n, sym, op["strike"], st["cost_basis"])
+                log("wheel_assigned", symbol=sym, qty=100 * n, price=op["strike"], dry_run=dry)
             elif op["kind"] == "call" and shares <= op["shares_before"] - 100 * n:
                 gain = (op["strike"] - (st["cost_basis"] or op["strike"])) * 100 * n
                 st["cycles"].append({"ended": today.isoformat(), "stock_gain": money(gain),
@@ -481,6 +600,8 @@ def wheel_step(api, st, today, dry):
                 st["history"].append({"date": today.isoformat(), "event": "called away",
                                       "strike": op["strike"], "stock_gain": money(gain)})
                 st["cost_basis"] = None
+                log(("cc" if st.get("mode") == "cc" else "wheel") + "_called_away", symbol=sym, qty=100 * n,
+                    price=op["strike"], dry_run=dry)
                 msg = "CALLED AWAY at %.2f: stock gain %.2f. %s" % (
                     op["strike"], gain, "New calls once you hold 100 shares again." if st.get("mode") == "cc"
                     else "Back to selling puts.")
@@ -817,6 +938,8 @@ def collar_step(api, st, today, dry):
             how, at_k = "EXPIRED", None
             msg = "%s: the collar expiring %s is over; both options expired and the shares stay." % (
                 sym, op["expiration"])
+        log("collar_" + how.lower().replace(" ", "_"), symbol=sym, qty=100 * n if sold else None, price=at_k,
+            dry_run=dry)
         st["cycles"].append({"ended": today.isoformat(), "expiration": op["expiration"], "how": how,
                              "sold_at": at_k, "net": op["net"]})
         st["history"].append({"date": today.isoformat(), "event": how.lower(), "expiration": op["expiration"]})
@@ -2827,6 +2950,13 @@ def parser():
     g.add_parser("run")
     g.add_parser("stop")
 
+    nt = sub.add_parser("notify").add_subparsers(dest="sub", required=True)
+    p = nt.add_parser("setup")
+    p.add_argument("--phone", action="store_true", help="also push to your phone with the ntfy app")
+    p.add_argument("--no-windows", action="store_true", help="no Windows pop-ups")
+    nt.add_parser("test")
+    nt.add_parser("off")
+
     k = sub.add_parser("collar").add_subparsers(dest="sub", required=True)
     p = k.add_parser("start")
     p.add_argument("symbol")
@@ -2878,7 +3008,8 @@ def main(argv=None, api=None):
           ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop,
           ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop,
           ("fcr", "start"): fcr_start, ("fcr", "run"): fcr_run, ("fcr", "stop"): fcr_stop,
-          ("collar", "start"): collar_start, ("collar", "run"): collar_run, ("collar", "stop"): collar_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("collar", "start"): collar_start, ("collar", "run"): collar_run, ("collar", "stop"): collar_stop,
+          ("notify", "setup"): notify_setup, ("notify", "test"): notify_test, ("notify", "off"): notify_off}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:

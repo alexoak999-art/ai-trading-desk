@@ -380,6 +380,17 @@ can trade lower; the put gains as they do), early assignment of the call is
 possible before an ex-dividend date, and a zero-cost collar usually means a
 cap about as far up as the floor is down.
 
+## Step 5l: trade alerts
+
+`notify setup` turns on a Windows pop-up for every order a bot places or
+closes (buys, sells, shorts, option orders, stops and targets hit,
+assignments); stop raises and dry runs are quiet. `notify setup --phone`
+also pushes each one to the user's phone through the free ntfy app: it makes
+a random topic name, kept in `trader/notify.json`; the user installs ntfy and
+subscribes to that topic. The alert text (symbol, side, size, prices) goes
+through ntfy.sh, and anyone with the topic name can read it. `notify test`
+sends one; `notify off` stops them. A failed alert never stops a trade.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
