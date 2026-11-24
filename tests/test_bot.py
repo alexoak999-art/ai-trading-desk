@@ -494,6 +494,121 @@ class CoveredCalls(InTmp):
         self.assertIn("cc TSLA: on; premiums so far $500.00, cost basis 240.0, open: call", out)
 
 
+def occ(sym, exp, kind, strike):
+    return "%s%s%s%08d" % (sym, exp.strftime("%y%m%d"), "P" if kind == "put" else "C", int(strike * 1000))
+
+
+class Collar(InTmp):
+    def setUp(self):
+        super().setUp()
+        self.api = FakeAlpaca()
+        self.api.prices["XYZ"] = 100.0
+        self.api._fill("XYZ", 100, 90.0)
+        self.exp = TODAY + datetime.timedelta(days=45)
+        quotes = {("put", 85): (0.5, 0.7), ("put", 90): (1.0, 1.2), ("put", 95): (2.0, 2.4),
+                  ("call", 105): (2.0, 2.2), ("call", 110): (0.9, 1.1), ("call", 115): (0.4, 0.6)}
+        for (kind, k), q in quotes.items():
+            s = occ("XYZ", self.exp, kind, k)
+            self.api.contracts.append({"symbol": s, "type": kind, "strike_price": str(k),
+                                       "expiration_date": self.exp.isoformat()})
+            self.api.quotes[s] = q
+        self.put, self.call = occ("XYZ", self.exp, "put", 90), occ("XYZ", self.exp, "call", 110)
+
+    def on(self, *extra):
+        rc, out = run(self.api, "collar", "start", "XYZ", *extra)
+        self.assertEqual(rc, 0, out)
+        rc, first = run(self.api, "collar", "run")
+        rc, second = run(self.api, "collar", "run")
+        return first, second
+
+    def settle(self, shares, price):
+        """Expiration: both options are gone; the shares are whatever is left."""
+        for s in (self.put, self.call):
+            self.api.pos[s]["qty"] = "0"
+        self.api.pos["XYZ"]["qty"] = str(shares)
+        self.api.prices["XYZ"] = price
+
+    def test_opens_a_put_and_a_call_on_one_expiration(self):
+        first, second = self.on()
+        self.assertIn("XYZ at 100.00: COLLAR exp %s (45 days): BUY 1 PUT %s 90.00 strike at 1.10 limit" % (
+            self.exp.isoformat(), self.put), first)
+        self.assertIn("SELL 1 CALL %s 110.00 strike at 1.00 limit" % self.call, first)
+        self.assertIn("Net cost 0.10 a share ($10). Floor 90.00 (-10.0%), cap 110.00 (+10.0%)", first)
+        self.assertEqual([(o["symbol"], o["side"]) for o in self.api.sent], [(self.put, "buy"), (self.call, "sell")])
+        self.assertIn("COLLAR ON, exp %s: put 90.00 bought at 1.10, call 110.00 sold at 1.00; net cost 0.10" %
+                      self.exp.isoformat(), second)
+        rc, third = run(self.api, "collar", "run")
+        self.assertIn("XYZ: collared at 100.00, floor 90.00 (put), cap 110.00 (call)", third)
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_too_costly_is_not_opened(self):
+        rc, out = run(self.api, "collar", "start", "XYZ", "--put-otm", "5", "--call-otm", "15", "--max-debit", "0")
+        rc, out = run(self.api, "collar", "run")
+        self.assertIn("costs 1.70 a share, more than --max-debit 0.00; not opened", out)  # put 95 at 2.20 - call 115 at 0.50
+        self.assertEqual(self.api.sent, [])
+
+    def test_call_never_under_cost(self):
+        self.api.pos["XYZ"]["avg_entry_price"] = "112"
+        first, second = self.on("--max-debit", "1")
+        self.assertIn("SELL 1 CALL %s 115.00 strike" % occ("XYZ", self.exp, "call", 115), first)
+
+    def test_both_expire_then_the_next_collar(self):
+        self.on()
+        self.settle(100, 100.0)
+        rc, out = run(self.api, "collar", "run")
+        self.assertIn("both options expired and the shares stay", out)
+        self.assertIn("COLLAR exp", out)
+        self.assertEqual(len(self.api.sent), 4)
+        self.assertEqual(bot.load(bot.collar_path("XYZ"))["cycles"][0]["how"], "EXPIRED")
+
+    def test_put_exercised_below_the_floor(self):
+        self.on()
+        self.settle(0, 80.0)
+        rc, out = run(self.api, "collar", "run")
+        self.assertIn("XYZ: PUT EXERCISED, 100 shares sold at 90.00", out)
+        self.assertEqual(len(self.api.sent), 2)
+
+    def test_called_away_over_the_cap(self):
+        self.on()
+        self.settle(0, 120.0)
+        rc, out = run(self.api, "collar", "run")
+        self.assertIn("XYZ: CALLED AWAY, 100 shares sold at 110.00", out)
+
+    def test_an_unfilled_leg_is_sent_again(self):
+        run(self.api, "collar", "start", "XYZ")
+        run(self.api, "collar", "run")
+        self.api.pos[self.call]["qty"] = "0"
+        [o for o in self.api.orders.values() if o["symbol"] == self.call][0]["status"] = "expired"
+        rc, out = run(self.api, "collar", "run")
+        self.assertIn("XYZ: the call order ended unfilled; sending it again: SELL 1 CALL", out)
+        self.assertEqual([o["symbol"] for o in self.api.sent], [self.put, self.call, self.call])
+
+    def test_needs_shares_and_keeps_out_of_other_strategies(self):
+        self.api.pos["XYZ"]["qty"] = "40"
+        rc, out = run(self.api, "collar", "start", "XYZ")
+        self.assertEqual(rc, 1)
+        self.assertIn("you hold 40 XYZ; 1 collar(s) need 100. Buy the other 60 first", out)
+        rc, out = run(self.api, "collar", "start", "XYZ", "--buy-shares")
+        self.assertIn("BOUGHT 60 XYZ", out)
+        self.assertEqual(bot.strategy_symbols().get("XYZ"), "collar")
+        self.assertIn("XYZ", bot.other_bot_symbols())
+        rc, out = run(self.api, "cc", "start", "XYZ")
+        self.assertEqual(rc, 1)
+        self.assertIn("XYZ is traded by the collar strategy", out)
+
+    def test_dry_run_status_and_stop(self):
+        rc, out = run(self.api, "--dry-run", "collar", "start", "XYZ")
+        self.assertIn("COLLAR exp", out)
+        self.assertEqual(self.api.sent, [])
+        self.assertFalse(os.path.exists(bot.collar_path("XYZ")))
+        self.on()
+        rc, out = run(self.api, "status")
+        self.assertIn("collar XYZ: on; put 90.00 / call 110.00 exp %s (put open, call open); net premiums $-10.00"
+                      % self.exp.isoformat(), out)
+        rc, out = run(self.api, "collar", "stop", "XYZ")
+        self.assertIn("no new collars. The open one (exp %s) stays until it expires" % self.exp.isoformat(), out)
+
+
 class Status(InTmp):
     def test_status_runs(self):
         api = FakeAlpaca()

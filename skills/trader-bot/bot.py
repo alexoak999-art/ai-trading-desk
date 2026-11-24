@@ -3,7 +3,8 @@
 trades, the options wheel, a 200-day trend swing, an opening-range breakout
 day trade, an oversold bounce, dollar-cost averaging, covered calls,
 rebalancing to target weights, a gap-and-go day trade, momentum rotation, and
-the First Candle Rule (a 5-minute fair-value-gap break, long and short). PAPER ACCOUNT ONLY.
+the First Candle Rule (a 5-minute fair-value-gap break, long and short), and a
+protective collar (a put under 100 shares paid for by a call over them). PAPER ACCOUNT ONLY.
 
   python bot.py check                                   # keys work? paper? market open?
   python bot.py test-buy AAPL                           # the connection test: buy 1 share
@@ -39,6 +40,9 @@ the First Candle Rule (a 5-minute fair-value-gap break, long and short). PAPER A
   python bot.py fcr start SPY QQQ --sides both --target-r 3 --max-loss 100 --last-entry 11:30
   python bot.py fcr run                                 # every minute in market hours
   python bot.py fcr stop                                # no new trades; open ones still closed by 15:55
+  python bot.py collar start AAPL --put-otm 10 --call-otm 10 --dte 30-60 --max-debit 0.5 [--buy-shares]
+  python bot.py collar run                              # every 15 min in market hours
+  python bot.py collar stop AAPL                        # no new collars; the open one runs to expiration
   python bot.py status                                 # account + every strategy
   add --dry-run to any command to print what it would send without sending it.
 
@@ -578,6 +582,8 @@ def strategy_symbols():
             continue
         if f.startswith(("trail-", "wheel-")) and st.get("status") in ("open", "on"):
             out[st["symbol"]] = f.split("-")[0]
+        elif f.startswith("collar-") and (st.get("status") == "on" or st.get("open")):
+            out[st["symbol"]] = "collar"
         elif f in ("swing.json", "bounce.json"):
             out.update({s: f[:-5] for s in st.get("positions", {})})
         elif f in ("orb.json", "gap.json", "fcr.json"):
@@ -697,6 +703,260 @@ def cc_stop(api, a):
     return 0
 
 
+# ---------------------------------------------------------------- strategy 13: protective collar
+
+def collar_path(sym):
+    return os.path.join(DIR, "collar-%s.json" % sym)
+
+
+def collar_pick(puts, calls, quotes, put_target, call_target, today, dte_min, dte_max):
+    """One expiration with both legs: the highest put strike at or under put_target and the lowest call strike
+    at or over call_target, each with a real bid and ask. Expirations nearest the middle of the window first."""
+    mid_dte = (dte_min + dte_max) / 2
+    exps = sorted({c["expiration_date"] for c in puts + calls},
+                  key=lambda e: abs((datetime.date.fromisoformat(e) - today).days - mid_dte))
+    for exp in exps:
+        dte = (datetime.date.fromisoformat(exp) - today).days
+        if not dte_min <= dte <= dte_max:
+            continue
+        legs = {}
+        for kind, cons, ok in (("put", puts, lambda k: k <= put_target), ("call", calls, lambda k: k >= call_target)):
+            cands = []
+            for c in cons:
+                bid, ask = quotes.get(c["symbol"], (0, 0))
+                if c["expiration_date"] == exp and bid > 0 and ask > 0 and ok(float(c["strike_price"])):
+                    cands.append((float(c["strike_price"]), c["symbol"], bid, ask))
+            if cands:
+                k, s, bid, ask = (max if kind == "put" else min)(cands)
+                legs[kind] = {"symbol": s, "strike": k, "bid": bid, "ask": ask, "limit": money((bid + ask) / 2)}
+        if len(legs) == 2:
+            return dict(legs, expiration=exp, dte=dte)
+    return None
+
+
+def collar_leg_fill(api, leg, opts, n):
+    """Update one leg from Alpaca: 'open' once the position is there, 'dead' if the order ended unfilled."""
+    p = opts.get(leg["symbol"])
+    if p and abs(float(p["qty"])) >= n:
+        o = (api.order(leg["order_id"]) if leg.get("order_id") else None) or {}
+        leg.update(status="open", price=money(abs(float(o.get("filled_avg_price") or p["avg_entry_price"]))))
+    else:
+        o = api.order(leg["order_id"]) if leg.get("order_id") else None
+        if not o or o.get("status") in ("canceled", "expired", "rejected", "done_for_day"):
+            leg["status"] = "dead"
+
+
+def collar_send(api, sym, leg, kind, n, dry):
+    side = "buy" if kind == "put" else "sell"
+    bid, ask = api.option_quotes([leg["symbol"]]).get(leg["symbol"], (leg.get("bid", 0), leg.get("ask", 0)))
+    if bid > 0 and ask > 0:
+        leg.update(bid=bid, ask=ask, limit=money((bid + ask) / 2))
+    o = api.submit_order(symbol=leg["symbol"], qty=n, side=side, type="limit", limit_price=leg["limit"],
+                         time_in_force="day")
+    leg.update(order_id=o.get("id"), status="open" if dry else "opening")
+    log("collar_" + side, symbol=leg["symbol"], kind=kind, strike=leg["strike"], limit=leg["limit"], dry_run=dry)
+    return "%s %d %s %s %.2f strike at %.2f limit (bid %.2f / ask %.2f)" % (
+        "BUY" if kind == "put" else "SELL", n, kind.upper(), leg["symbol"], leg["strike"], leg["limit"],
+        leg.get("bid", 0), leg.get("ask", 0))
+
+
+def collar_step(api, st, today, dry):
+    sym, n = st["symbol"], st["contracts"]
+    pos = api.position(sym)
+    shares = int(float(pos["qty"])) if pos else 0
+    opts = {p["symbol"]: p for p in api.positions()
+            if p.get("asset_class") == "us_option" and occ_underlying(p["symbol"]) == sym}
+    op = st.get("open")
+    out = []
+
+    # 1. legs still being filled: record fills; resend a leg whose day order ended unfilled
+    if op and any(op[k]["status"] in ("opening", "dead") for k in ("put", "call")):
+        for kind in ("put", "call"):
+            if op[kind]["status"] == "opening":
+                collar_leg_fill(api, op[kind], opts, n)
+        if all(op[k]["status"] == "dead" for k in ("put", "call")):
+            st["open"] = None
+            return "%s: neither collar order filled; a fresh collar is priced on the next run." % sym
+        for kind in ("put", "call"):
+            if op[kind]["status"] == "dead" and st.get("status") == "on":
+                out.append("%s: the %s order ended unfilled; sending it again: %s." % (
+                    sym, kind, collar_send(api, sym, op[kind], kind, n, dry)))
+        if any(op[k]["status"] != "open" for k in ("put", "call")):
+            return "\n".join(out) or "%s: waiting for the collar orders to fill (put %s, call %s)." % (
+                sym, op["put"]["status"], op["call"]["status"])
+        op["net"] = money(op["put"]["price"] - op["call"]["price"])
+        st["net_total"] = money(st["net_total"] - op["net"] * 100 * n)
+        st["history"].append({"date": today.isoformat(), "event": "collar on", "expiration": op["expiration"],
+                              "put": op["put"]["strike"], "call": op["call"]["strike"], "net": op["net"]})
+        return "%s: COLLAR ON, exp %s: put %.2f bought at %.2f, call %.2f sold at %.2f; net %s %.2f a share." % (
+            sym, op["expiration"], op["put"]["strike"], op["put"]["price"], op["call"]["strike"],
+            op["call"]["price"], "cost" if op["net"] > 0 else "credit", abs(op["net"]))
+
+    # 2. a collar on: report, or settle it once both legs are gone (expired, exercised or assigned)
+    if op:
+        have = [k for k in ("put", "call") if op[k]["symbol"] in opts]
+        if have:
+            price = api.last_price(sym)
+            dte = (datetime.date.fromisoformat(op["expiration"]) - today).days
+            if len(have) == 1 and shares < op["shares_before"]:
+                return "%s: the %s was assigned or exercised early (shares %d -> %d); the %s %s is still open. " \
+                       "Close it in the dashboard or let it expire." % (
+                           sym, "call" if "put" in have else "put", op["shares_before"], shares, have[0],
+                           op[have[0]]["symbol"])
+            return "%s: collared at %.2f, floor %.2f (put), cap %.2f (call), exp %s (%d days); net %s %.2f a share." % (
+                sym, price, op["put"]["strike"], op["call"]["strike"], op["expiration"], dte,
+                "cost" if op["net"] > 0 else "credit", abs(op["net"]))
+        sold = shares <= op["shares_before"] - 100 * n
+        if sold:
+            price = api.last_price(sym)
+            how, at_k = ("PUT EXERCISED", op["put"]["strike"]) if price <= op["put"]["strike"] else \
+                ("CALLED AWAY", op["call"]["strike"])
+            msg = "%s: %s, %d shares sold at %.2f. %s" % (
+                sym, how, 100 * n, at_k, "New collars once you hold %d shares again." % (100 * n))
+        else:
+            how, at_k = "EXPIRED", None
+            msg = "%s: the collar expiring %s is over; both options expired and the shares stay." % (
+                sym, op["expiration"])
+        st["cycles"].append({"ended": today.isoformat(), "expiration": op["expiration"], "how": how,
+                             "sold_at": at_k, "net": op["net"]})
+        st["history"].append({"date": today.isoformat(), "event": how.lower(), "expiration": op["expiration"]})
+        st["open"] = op = None
+        out.append(msg)
+        if sold:
+            return "\n".join(out)
+
+    # 3. nothing on: price the next collar
+    if st.get("status") != "on":
+        return "\n".join(out + ["%s: stopped; no new collars." % sym])
+    if shares < 100 * n:
+        return "\n".join(out + ["%s: you hold %d shares; %d collar(s) need %d. Nothing to do." % (
+            sym, shares, n, 100 * n)])
+    if st.get("cost_basis") is None:
+        st["cost_basis"] = money(float(pos["avg_entry_price"]))
+    price = api.last_price(sym)
+    put_t = money(price * (1 - st["put_otm"] / 100))
+    call_t = money(max(price * (1 + st["call_otm"] / 100), st["cost_basis"] * (1 + st["over_cost"] / 100)))
+    lo = (today + datetime.timedelta(days=st["dte_min"])).isoformat()
+    hi = (today + datetime.timedelta(days=st["dte_max"])).isoformat()
+    puts = api.option_contracts(sym, "put", lo, hi, put_t * 0.85, put_t)
+    calls = api.option_contracts(sym, "call", lo, hi, call_t, call_t * 1.15)
+    syms = [c["symbol"] for c in puts + calls]
+    quotes = api.option_quotes(syms) if syms else {}
+    pick = collar_pick(puts, calls, quotes, put_t, call_t, today, st["dte_min"], st["dte_max"])
+    if not pick:
+        return "\n".join(out + ["%s: no expiration %s to %s with both a put at or under %.2f and a call at or over "
+                                "%.2f with real quotes. Try a wider --dte." % (sym, lo, hi, put_t, call_t)])
+    net = money(pick["put"]["limit"] - pick["call"]["limit"])
+    if net > st["max_debit"]:
+        return "\n".join(out + ["%s: the %s collar (put %.2f at %.2f, call %.2f at %.2f) costs %.2f a share, more "
+                                "than --max-debit %.2f; not opened. Wider strikes or a later expiration cost less." % (
+                                    sym, pick["expiration"], pick["put"]["strike"], pick["put"]["limit"],
+                                    pick["call"]["strike"], pick["call"]["limit"], net, st["max_debit"])])
+    op = st["open"] = {"expiration": pick["expiration"], "put": pick["put"], "call": pick["call"],
+                       "shares_before": shares, "net": net}
+    lines = [collar_send(api, sym, op["put"], "put", n, dry), collar_send(api, sym, op["call"], "call", n, dry)]
+    if dry:
+        op["put"]["price"], op["call"]["price"] = op["put"]["limit"], op["call"]["limit"]
+    out.append("%s at %.2f: COLLAR exp %s (%d days): %s; %s. Net %s %.2f a share ($%.0f). Floor %.2f (-%.1f%%), "
+               "cap %.2f (+%.1f%%)." % (
+                   sym, price, pick["expiration"], pick["dte"], lines[0], lines[1],
+                   "cost" if net > 0 else "credit", abs(net), abs(net) * 100 * n,
+                   pick["put"]["strike"], (1 - pick["put"]["strike"] / price) * 100,
+                   pick["call"]["strike"], (pick["call"]["strike"] / price - 1) * 100))
+    return "\n".join(out)
+
+
+def collar_start(api, a):
+    sym, n = a.symbol.upper(), a.contracts
+    other = strategy_symbols().get(sym)
+    if other and other != "collar":
+        say("collar: %s is traded by the %s strategy; a collar would sell calls or protect shares it manages. "
+            "Pick another name." % (sym, other))
+        return 1
+    try:
+        lo, hi = (int(x) for x in a.dte.split("-"))
+    except ValueError:
+        say("collar: --dte is a range of days, e.g. 30-60")
+        return 1
+    if n < 1 or a.put_otm < 0 or a.call_otm < 0 or a.over_cost < 0 or not 0 < lo <= hi:
+        say("collar: --contracts >= 1, --put-otm, --call-otm and --over-cost >= 0, --dte like 30-60")
+        return 1
+    st = load(collar_path(sym)) or {"symbol": sym, "net_total": 0.0, "cost_basis": None, "open": None,
+                                    "cycles": [], "history": []}
+    st.update(put_otm=a.put_otm, call_otm=a.call_otm, over_cost=a.over_cost, dte_min=lo, dte_max=hi,
+              max_debit=a.max_debit, contracts=n, status="on")
+    pos = api.position(sym)
+    shares, need = (int(float(pos["qty"])) if pos else 0), 100 * n
+    price = api.last_price(sym)
+    preview_api = api
+    if shares < need:
+        missing = need - shares
+        if not a.buy_shares:
+            say("collar: you hold %d %s; %d collar(s) need %d. Buy the other %d first (about $%.0f), "
+                "or add --buy-shares." % (shares, sym, n, need, missing, missing * price))
+            return 1
+        cash = float(api.account().get("cash") or 0)
+        if missing * price > cash:
+            say("collar: %d %s cost about $%.0f and cash is $%.0f." % (missing, sym, missing * price, cash))
+            return 1
+        if not market_open(api):
+            return 1
+        o = wait_fill(api, api.submit_order(symbol=sym, qty=missing, side="buy", type="market",
+                                            time_in_force="day"))
+        log("collar_buy_shares", symbol=sym, qty=missing, price=o.get("filled_avg_price"), dry_run=a.dry_run)
+        if a.dry_run or o.get("status") == "filled":
+            say("%s %d %s at about %.2f (to have %d to collar)." % (
+                "WOULD BUY" if a.dry_run else "BOUGHT", missing, sym, float(o.get("filled_avg_price") or price), need))
+        else:
+            say("ORDERED %d %s at market; %s filled so far (%s). `collar run` opens the collar once all %d are in."
+                % (missing, sym, o.get("filled_qty") or 0, o.get("status"), need))
+        if a.dry_run:
+            preview_api = PretendShares(api, sym, need, price)
+    if not a.dry_run:
+        save(collar_path(sym), st)
+    say("Collar on %s: for each 100 shares, buy a put about %g%% below the price (the floor) and sell a call about "
+        "%g%% above it (the cap; never under %g%% over your cost), same expiration %d-%d days out, at the bid/ask "
+        "midpoints, only if the pair costs at most %.2f a share. Below the put strike at expiration the shares are "
+        "sold at the strike; above the call strike they are called away; in between both expire and the next "
+        "collar is put on. `collar run` does the work." % (
+            sym, a.put_otm, a.call_otm, a.over_cost, lo, hi, a.max_debit))
+    if a.dry_run:
+        say("Preview of the first `collar run` (nothing is saved or sent):")
+        say(collar_step(preview_api, st, datetime.date.today(), True))
+    return 0
+
+
+def collar_run(api, a):
+    files = [f for f in sorted(os.listdir(DIR)) if f.startswith("collar-") and f.endswith(".json")] \
+        if os.path.isdir(DIR) else []
+    plans = [p for p in (load(os.path.join(DIR, f)) for f in files)
+             if p and (p.get("status") == "on" or p.get("open"))]
+    if not plans:
+        say("No collars. Start one with `collar start SYMBOL`.")
+        return 0
+    if not market_open(api):
+        return 0
+    for st in plans:
+        say(collar_step(api, st, datetime.date.today(), a.dry_run))
+        if not a.dry_run:
+            save(collar_path(st["symbol"]), st)
+    return 0
+
+
+def collar_stop(api, a):
+    sym = a.symbol.upper()
+    st = load(collar_path(sym))
+    if not st:
+        say("No collar on %s." % sym)
+        return 0
+    st["status"] = "off"
+    if not a.dry_run:
+        save(collar_path(sym), st)
+    say("Collar on %s: no new collars.%s" % (sym, " The open one (exp %s) stays until it expires." % st["open"][
+        "expiration"] if st.get("open") else ""))
+    return 0
+
+
 # ---------------------------------------------------------------- strategy 4: trend swing
 
 SWING = os.path.join(DIR, "swing.json")
@@ -727,9 +987,9 @@ def other_bot_symbols():
     """Symbols an open trailing-stop, wheel or covered-call plan trades, so the others keep out of them."""
     out = set()
     for f in sorted(os.listdir(DIR)) if os.path.isdir(DIR) else []:
-        if f.startswith(("trail-", "wheel-", "cc-")) and f.endswith(".json"):
+        if f.startswith(("trail-", "wheel-", "cc-", "collar-")) and f.endswith(".json"):
             st = load(os.path.join(DIR, f)) or {}
-            if st.get("status") in ("open", "on"):
+            if st.get("status") in ("open", "on") or (f.startswith("collar-") and st.get("open")):
                 out.add(st.get("symbol"))
     rot = load(ROT) if os.path.isdir(DIR) else None
     out.update(s for s, q in ((rot or {}).get("shares") or {}).items() if q > 0)
@@ -2365,6 +2625,13 @@ def status(api, a):
                 st["symbol"], st.get("status"), st["premium_total"], st.get("cost_basis"),
                 "call %s %.2f exp %s (%s)" % (op["symbol"], op["strike"], op["expiration"], op["status"])
                 if op else "nothing", len(st["cycles"])))
+        elif f.startswith("collar-"):
+            op = st.get("open")
+            say("collar %s: %s; %s; net premiums $%+.2f, collars finished %d" % (
+                st["symbol"], st.get("status"),
+                "put %.2f / call %.2f exp %s (put %s, call %s)" % (
+                    op["put"]["strike"], op["call"]["strike"], op["expiration"], op["put"]["status"],
+                    op["call"]["status"]) if op else "no collar on", st["net_total"], len(st["cycles"])))
         elif f == "copy.json":
             say("copy: %d trades copied so far" % len(st.get("trades", [])))
         elif f == "swing.json":
@@ -2560,6 +2827,21 @@ def parser():
     g.add_parser("run")
     g.add_parser("stop")
 
+    k = sub.add_parser("collar").add_subparsers(dest="sub", required=True)
+    p = k.add_parser("start")
+    p.add_argument("symbol")
+    p.add_argument("--contracts", type=int, default=1, help="collars, 100 shares each (default 1)")
+    p.add_argument("--put-otm", type=float, default=10, help="put strike at least this %% below the price (default 10)")
+    p.add_argument("--call-otm", type=float, default=10, help="call strike at least this %% above the price (default 10)")
+    p.add_argument("--over-cost", type=float, default=0, help="and the call at least this %% above your cost (default 0)")
+    p.add_argument("--dte", default="30-60", help="days to expiration window (default 30-60)")
+    p.add_argument("--max-debit", type=float, default=0.5,
+                   help="most the put may cost beyond the call's premium, per share (default 0.50; 0 = zero-cost)")
+    p.add_argument("--buy-shares", action="store_true", help="buy the missing shares at market first")
+    k.add_parser("run")
+    p = k.add_parser("stop")
+    p.add_argument("symbol")
+
     c = sub.add_parser("cc").add_subparsers(dest="sub", required=True)
     p = c.add_parser("start")
     p.add_argument("symbol")
@@ -2595,7 +2877,8 @@ def main(argv=None, api=None):
           ("rebal", "start"): rebal_start, ("rebal", "run"): rebal_run, ("rebal", "stop"): rebal_stop,
           ("gap", "start"): gap_start, ("gap", "run"): gap_run, ("gap", "stop"): gap_stop,
           ("rotate", "start"): rot_start, ("rotate", "run"): rot_run, ("rotate", "stop"): rot_stop,
-          ("fcr", "start"): fcr_start, ("fcr", "run"): fcr_run, ("fcr", "stop"): fcr_stop}[(a.cmd, getattr(a, "sub", None))]
+          ("fcr", "start"): fcr_start, ("fcr", "run"): fcr_run, ("fcr", "stop"): fcr_stop,
+          ("collar", "start"): collar_start, ("collar", "run"): collar_run, ("collar", "stop"): collar_stop}[(a.cmd, getattr(a, "sub", None))]
     try:
         return fn(api, a)
     except alp.AlpacaError as e:

@@ -3,7 +3,7 @@ name: trader-bot
 description: >-
   Paper-trading bot on Alpaca. Sets up an Alpaca paper account step by step
   (keys in an environment file, never in the chat), tests the connection with
-  a one-share buy, then runs twelve rule-based strategies on a schedule: a
+  a one-share buy, then runs thirteen rule-based strategies on a schedule: a
   trailing stop with ladder buys (a real stop order kept at Alpaca and raised
   as the price climbs), copying the stock trades a member of Congress
   discloses (House PTR filings), and the options wheel (cash-secured puts,
@@ -27,7 +27,9 @@ description: >-
   ~6-month return each month, hold the top few, sell what drops out, cash
   when nothing is up), and the First Candle Rule (the 9:30-9:35 candle's
   high and low, then a 1-minute break that leaves a fair value gap, a retest
-  and an engulfing candle; long or short, 3R target, flat by 3:55 PM).
+  and an engulfing candle; long or short, 3R target, flat by 3:55 PM), and
+  a protective collar (a put ~10% under 100 shares you hold, paid for by a
+  call ~10% over them, same expiration, rolled when they expire).
   Paper account only. Use when the user says "trading bot",
   "connect Alpaca", "paper trade automatically", "trailing stop", "ladder in",
   "copy Pelosi", "copy Congress trades", "wheel strategy", "sell puts",
@@ -37,8 +39,9 @@ description: >-
   only", "sell calls on my shares", "rebalance",
   "target weights", "60/40", "gap and go",
   "trade the gappers", "momentum rotation", "sector rotation", "hold the leaders", "first candle rule",
-  "FVG", "fair value gap", or "how is my bot doing".
-argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | rotate | fcr | status]"
+  "FVG", "fair value gap", "collar", "protect my shares",
+  "hedge with puts", or "how is my bot doing".
+argument-hint: "[setup | check | trail | copy | wheel | swing | orb | bounce | dca | cc | rebal | gap | rotate | fcr | collar | status]"
 ---
 
 # trader-bot: an Alpaca paper-trading bot
@@ -351,6 +354,32 @@ creator's claim, not something this bot or its tests show.
 The free IEX feed carries a few percent of the volume, so its 1-minute bars
 can show gaps the full tape does not, and the other way round.
 
+## Step 5k: strategy 13, the protective collar (options)
+
+`collar start SYMBOL` stores the rules; `collar run` every 15 minutes does the
+work. It needs 100 shares per collar (`--buy-shares` buys the rest at market)
+and options level 2 or more (buying puts). The user picks the name; never one
+another strategy trades (the covered calls or the wheel would sell a second
+call against the same shares).
+
+1. **The pair**: one expiration in `--dte` (30-60 days) with both legs: buy
+   the highest put at or under the price - `--put-otm`% (10), the floor, and
+   sell the lowest call at or over the price + `--call-otm`% (10) and over
+   cost + `--over-cost`% (0), the cap. Limit orders at each bid/ask midpoint.
+2. **Cost**: put minus call, per share. If it is more than `--max-debit`
+   (0.50; 0 means zero-cost only), nothing is opened and the next run prices
+   it again. A leg whose day order ends unfilled is sent again at the new
+   midpoint.
+3. **At expiration**: under the put strike, the put is exercised and the
+   shares are sold at that strike; over the call strike, they are called away
+   at the call strike; in between, both expire and the next collar is put on.
+4. `collar stop SYMBOL`: no new collars; the open one runs to expiration.
+
+Tell the user: the floor holds only at expiration (in between, the shares
+can trade lower; the put gains as they do), early assignment of the call is
+possible before an ex-dividend date, and a zero-cost collar usually means a
+cap about as far up as the floor is down.
+
 ## Step 6: run it on a schedule
 
 The checks are plain Python, so a system scheduler runs them without using
@@ -371,6 +400,7 @@ as a Mac mini), with the user's own folder:
 5 10 * * 1-5    cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rebal run >> trader/bot/cron.log 2>&1
 10 10 * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py rotate run >> trader/bot/cron.log 2>&1
 * 9-15 * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py fcr run >> trader/bot/cron.log 2>&1
+*/15 * * * 1-5 cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py collar run >> trader/bot/cron.log 2>&1
 */5  * * * 1-5  cd ~/trading && python3 ~/.claude/skills/trader-bot/bot.py gap run >> trader/bot/cron.log 2>&1
 ```
 
