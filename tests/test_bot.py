@@ -203,6 +203,28 @@ class Trail(InTmp):
         run(api, "trail", "run")             # the ladder fires once only
         self.assertEqual(float(api.pos["TSLA"]["qty"]), 15)
 
+    def test_ladder_buy_takes_the_stop_down_first(self):
+        class WashCheck(FakeAlpaca):  # Alpaca: no buy while an opposite-side stop is open
+            def submit_order(self, **o):
+                if o["side"] == "buy" and any(x["symbol"] == o["symbol"] and x["side"] == "sell" and
+                                              x["type"] == "stop" and x["status"] == "new" for x in self.orders.values()):
+                    raise bot.alp.AlpacaError("POST /v2/orders -> HTTP 403: potential wash trade detected")
+                return super().submit_order(**o)
+        api = WashCheck()
+        api.prices["TSLA"] = 100.0
+        run(api, "trail", "start", "TSLA", "--qty", "10", "--ladder", "5:5,8:10")
+        api.prices["TSLA"] = 94.0
+        rc, out = run(api, "trail", "run")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("LADDER BUY 5", out)
+        live = [o for o in api.orders.values() if o["type"] == "stop" and o["status"] == "new"]
+        self.assertEqual([(int(float(o["qty"])), float(o["stop_price"])) for o in live], [(15, 90.0)])
+        api.prices["TSLA"] = 91.5
+        rc, out = run(api, "trail", "run")
+        self.assertIn("LADDER BUY 10", out)
+        live = [o for o in api.orders.values() if o["type"] == "stop" and o["status"] == "new"]
+        self.assertEqual([int(float(o["qty"])) for o in live], [25])
+
     def test_closed_market_does_nothing(self):
         api = FakeAlpaca()
         api.prices["TSLA"] = 100.0

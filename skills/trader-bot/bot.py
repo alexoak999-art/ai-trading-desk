@@ -460,13 +460,30 @@ def trail_run(api, a):
             continue
         price = api.last_price(sym)
         st["hwm"] = money(max(st["hwm"], price))
-        for lv in st["ladder"]:
-            if not lv["done"] and price <= st["entry"] * (1 - lv["drop_pct"] / 100):
-                api.submit_order(symbol=sym, qty=lv["qty"], side="buy", type="market", time_in_force="day")
-                lv["done"] = True
-                held += lv["qty"]
-                log("trail_ladder", symbol=sym, qty=lv["qty"], price=price, drop_pct=lv["drop_pct"])
-                say("%s: LADDER BUY %d at about %.2f (-%g%% from entry)." % (sym, lv["qty"], price, lv["drop_pct"]))
+        due = [lv for lv in st["ladder"] if not lv["done"] and price <= st["entry"] * (1 - lv["drop_pct"] / 100)]
+        if due and st.get("stop_order_id"):
+            # Alpaca refuses a buy while our own sell stop on the name is open ("potential wash trade"):
+            # take the stop down first; a new one for every share goes back on below.
+            api.cancel_order(st["stop_order_id"])
+            wait_canceled(api, st["stop_order_id"], a.dry_run)
+            if (api.order(st["stop_order_id"]) or {}).get("status") == "filled":
+                say("%s: the stop filled while making room for a ladder buy; no buy. The plan closes next run." % sym)
+                if not a.dry_run:
+                    save(trail_path(sym), st)
+                continue
+            st["stop_order_id"] = None
+        for lv in due:
+            lv["done"] = True  # recorded before sending, so a failed run never buys the same rung twice
+            if not a.dry_run:
+                save(trail_path(sym), st)
+            o = wait_fill(api, api.submit_order(symbol=sym, qty=lv["qty"], side="buy", type="market",
+                                                time_in_force="day"))
+            if o.get("status") not in ("filled", "dry_run"):  # Alpaca won't take the stop while this buy is open
+                raise alp.AlpacaError("%s ladder buy of %d not filled yet (%s); the stop goes back on next run"
+                                      % (sym, lv["qty"], o.get("status")))
+            held += lv["qty"]
+            log("trail_ladder", symbol=sym, qty=lv["qty"], price=price, drop_pct=lv["drop_pct"])
+            say("%s: LADDER BUY %d at about %.2f (-%g%% from entry)." % (sym, lv["qty"], price, lv["drop_pct"]))
         new_floor = floor_for(st, st["hwm"])
         order = api.order(st["stop_order_id"]) if st.get("stop_order_id") else None
         live = order and order.get("status") in ("new", "accepted", "held", "pending_new",
