@@ -473,8 +473,14 @@ def trail_run(api, a):
                 continue
             st["stop_order_id"] = None
         for lv in due:
-            api.submit_order(symbol=sym, qty=lv["qty"], side="buy", type="market", time_in_force="day")
-            lv["done"] = True
+            lv["done"] = True  # recorded before sending, so a failed run never buys the same rung twice
+            if not a.dry_run:
+                save(trail_path(sym), st)
+            o = wait_fill(api, api.submit_order(symbol=sym, qty=lv["qty"], side="buy", type="market",
+                                                time_in_force="day"))
+            if o.get("status") not in ("filled", "dry_run"):  # Alpaca won't take the stop while this buy is open
+                raise alp.AlpacaError("%s ladder buy of %d not filled yet (%s); the stop goes back on next run"
+                                      % (sym, lv["qty"], o.get("status")))
             held += lv["qty"]
             log("trail_ladder", symbol=sym, qty=lv["qty"], price=price, drop_pct=lv["drop_pct"])
             say("%s: LADDER BUY %d at about %.2f (-%g%% from entry)." % (sym, lv["qty"], price, lv["drop_pct"]))
